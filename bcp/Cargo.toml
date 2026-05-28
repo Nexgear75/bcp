@@ -1,0 +1,9 @@
+[package]
+name = "bcp"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+progress_copy = { path = "../progress_copy" }
+clap = { version = "4.6.1", features = ["derive"] }
+anyhow = "1.0.102"

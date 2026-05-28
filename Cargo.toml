@@ -1,0 +1,3 @@
+[workspace]
+members = ["progress_copy", "bcp", "bmv"]
+resolver = "2"
