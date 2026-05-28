@@ -3,7 +3,7 @@ use predicates::prelude::*;
 use std::io::Write;
 use tempfile::NamedTempFile;
 
-// ── Test 8: CLI help ───────────────────────────────────────────────
+// ── CLI help ───────────────────────────────────────────────────────
 
 #[test]
 fn test_cli_help() {
@@ -20,7 +20,7 @@ fn test_cli_help() {
         .stdout(predicate::str::contains("--version"));
 }
 
-// ── Test 9: missing args ───────────────────────────────────────────
+// ── Missing args (usage error) ─────────────────────────────────────
 
 #[test]
 fn test_cli_missing_args() {
@@ -31,7 +31,7 @@ fn test_cli_missing_args() {
         .code(2);
 }
 
-// ── Test 10: version ──────────────────────────────────────────────
+// ── Version flag ───────────────────────────────────────────────────
 
 #[test]
 fn test_cli_version() {
@@ -42,7 +42,7 @@ fn test_cli_version() {
         .code(0);
 }
 
-// ── Test 11: full end-to-end copy ─────────────────────────────────
+// ── End-to-end copy ────────────────────────────────────────────────
 
 #[test]
 fn test_end_to_end_copy() {
@@ -55,23 +55,136 @@ fn test_end_to_end_copy() {
     let dst_path = dst_dir.path().join("dest.bin");
     let dst_str = dst_path.to_string_lossy().to_string();
 
-    // Note: src NamedTempFile lives until end of test, keeping
-    // the file alive on disk for the bcp process to read.
     let mut cmd = Command::cargo_bin("bcp").unwrap();
     cmd.arg(src.path().to_string_lossy().as_ref())
         .arg(&dst_str);
 
-    let output = cmd.output().unwrap();
+    cmd.assert()
+        .success()
+        .code(0);
 
-    // Stub run() returns Ok — but doesn't actually copy, so
-    // dest won't exist. This test will FAIL in RED phase.
-    if output.status.success() {
-        assert!(
-            dst_path.exists(),
-            "Destination should exist after successful copy"
-        );
-        let dest_content = std::fs::read(&dst_path).unwrap();
-        let src_content = std::fs::read(src.path()).unwrap();
-        assert_eq!(dest_content, src_content);
-    }
+    // Destination should exist with matching content
+    assert!(
+        dst_path.exists(),
+        "Destination should exist after successful copy"
+    );
+    let dest_content = std::fs::read(&dst_path).unwrap();
+    let src_content = std::fs::read(src.path()).unwrap();
+    assert_eq!(dest_content, src_content, "Dest content must match source");
+}
+
+// ── Self-copy rejection ────────────────────────────────────────────
+
+#[test]
+fn test_self_copy_rejection() {
+    let mut tmp = NamedTempFile::new().unwrap();
+    tmp.write_all(b"test data").unwrap();
+    tmp.flush().unwrap();
+
+    let path_str = tmp.path().to_string_lossy().to_string();
+
+    let mut cmd = Command::cargo_bin("bcp").unwrap();
+    cmd.arg(&path_str).arg(&path_str);
+    cmd.assert().failure();
+}
+
+// ── Verbose flag ───────────────────────────────────────────────────
+
+#[test]
+fn test_verbose_flag() {
+    let mut src = NamedTempFile::new().unwrap();
+    src.write_all(b"verbose test content").unwrap();
+    src.flush().unwrap();
+
+    let dst_dir = tempfile::TempDir::new().unwrap();
+    let dst_path = dst_dir.path().join("verbose_out.bin");
+    let dst_str = dst_path.to_string_lossy().to_string();
+
+    let mut cmd = Command::cargo_bin("bcp").unwrap();
+    cmd.arg("-v")
+        .arg(src.path().to_string_lossy().as_ref())
+        .arg(&dst_str);
+
+    cmd.assert().success();
+}
+
+// ── Force flag overwrites existing dest ────────────────────────────
+
+#[test]
+fn test_force_flag_overwrites() {
+    let mut src = NamedTempFile::new().unwrap();
+    src.write_all(b"original content").unwrap();
+    src.flush().unwrap();
+
+    let dst_dir = tempfile::TempDir::new().unwrap();
+    let dst_path = dst_dir.path().join("force_dest.bin");
+
+    // Pre-create destination with different content
+    std::fs::write(&dst_path, b"different content").unwrap();
+    let dst_str = dst_path.to_string_lossy().to_string();
+
+    let mut cmd = Command::cargo_bin("bcp").unwrap();
+    cmd.arg("-f")
+        .arg(src.path().to_string_lossy().as_ref())
+        .arg(&dst_str);
+
+    cmd.assert().success();
+
+    // Destination content should now match source
+    let dest_content = std::fs::read(&dst_path).unwrap();
+    let src_content = std::fs::read(src.path()).unwrap();
+    assert_eq!(dest_content, src_content, "Force must overwrite dest with source content");
+}
+
+// ── No-clobber refuses existing dest ───────────────────────────────
+
+#[test]
+fn test_no_clobber_refuses() {
+    let mut src = NamedTempFile::new().unwrap();
+    src.write_all(b"new content").unwrap();
+    src.flush().unwrap();
+
+    let dst_dir = tempfile::TempDir::new().unwrap();
+    let dst_path = dst_dir.path().join("no_clobber_dest.bin");
+
+    // Pre-create destination
+    std::fs::write(&dst_path, b"existing content").unwrap();
+    let dst_str = dst_path.to_string_lossy().to_string();
+
+    let mut cmd = Command::cargo_bin("bcp").unwrap();
+    cmd.arg("-n")
+        .arg(src.path().to_string_lossy().as_ref())
+        .arg(&dst_str);
+
+    cmd.assert().failure();
+}
+
+// ── Nonexistent source ─────────────────────────────────────────────
+
+#[test]
+fn test_nonexistent_source() {
+    let mut cmd = Command::cargo_bin("bcp").unwrap();
+    cmd.arg("/nonexistent_path_xyz_12345").arg("/tmp/nonexistent_out");
+    cmd.assert().failure();
+}
+
+// ── Conflicting flags (-f + -n) ────────────────────────────────────
+
+#[test]
+fn test_conflicting_flags() {
+    let mut src = NamedTempFile::new().unwrap();
+    src.write_all(b"some data").unwrap();
+    src.flush().unwrap();
+
+    let dst_dir = tempfile::TempDir::new().unwrap();
+    let dst_path = dst_dir.path().join("conflict_dest.bin");
+    let dst_str = dst_path.to_string_lossy().to_string();
+
+    let mut cmd = Command::cargo_bin("bcp").unwrap();
+    cmd.arg("-f")
+        .arg("-n")
+        .arg(src.path().to_string_lossy().as_ref())
+        .arg(&dst_str);
+
+    cmd.assert().failure();
 }
