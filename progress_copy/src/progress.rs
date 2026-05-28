@@ -1,9 +1,11 @@
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
+
+use crate::signals::CancelState;
 
 /// Create a `ProgressBar` configured for single-file copy display.
 ///
@@ -46,20 +48,30 @@ pub fn create_progress_bar(file_size: u64, source_name: &str) -> ProgressBar {
 /// Spawn a background thread that reads the `bytes_copied` atomic
 /// counter every 100ms and updates the progress bar position (D-06).
 ///
-/// The thread exits when `cancelled` becomes `true`, then calls
-/// `bar.finish_and_clear()`.
+/// The thread exits when `cancel_state.cancelled` becomes `true`,
+/// then calls `bar.finish_and_clear()`.
 pub fn spawn_progress_ticker(
     bar: ProgressBar,
     bytes_copied: Arc<AtomicU64>,
-    cancelled: Arc<AtomicBool>,
+    cancel_state: Arc<CancelState>,
 ) -> JoinHandle<()> {
+    let total = bar.length();
     std::thread::spawn(move || loop {
-        if cancelled.load(Ordering::Relaxed) {
+        if cancel_state.cancelled.load(Ordering::Relaxed) {
             bar.finish_and_clear();
             break;
         }
         let current = bytes_copied.load(Ordering::Relaxed);
         bar.set_position(current);
+        // Exit cleanly when the copy is complete (position reaches the
+        // known file size).  Without this the thread spins forever and
+        // `ticker.join()` in the main thread deadlocks on normal (non-
+        // cancelled) completion.
+        if let Some(end) = total {
+            if current >= end {
+                break;
+            }
+        }
         std::thread::sleep(Duration::from_millis(100));
     })
 }
@@ -112,11 +124,11 @@ mod tests {
     #[test]
     fn test_progress_ticker_reads_atomic() {
         let bytes = Arc::new(AtomicU64::new(0));
-        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancel_state = Arc::new(CancelState::new());
         let bar = ProgressBar::new(10_000);
 
         let bytes_ticker = Arc::clone(&bytes);
-        let cancel_ticker = Arc::clone(&cancelled);
+        let cancel_ticker = Arc::clone(&cancel_state);
 
         let ticker = spawn_progress_ticker(bar.clone(), bytes_ticker, cancel_ticker);
 
@@ -133,7 +145,7 @@ mod tests {
         );
 
         // Cancel the ticker
-        cancelled.store(true, Ordering::Relaxed);
+        cancel_state.cancelled.store(true, Ordering::Relaxed);
         ticker.join().unwrap();
     }
 }
