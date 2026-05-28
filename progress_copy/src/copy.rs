@@ -1,4 +1,5 @@
-use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::io::{Read, Write};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::error::CopyError;
@@ -9,19 +10,42 @@ use crate::error::CopyError;
 /// Returns `Ok(total_bytes)` on success or `Err(Cancelled)` if the
 /// `cancelled` flag is set.
 ///
-/// Each chunk increments `bytes_copied` so the progress display thread
-/// can read it lock-free. The `cancelled` flag is checked before every
-/// read so a SIGINT handler can stop the copy cleanly.
+/// Each chunk read increments `bytes_copied` so the progress display
+/// thread can read it lock-free. The `cancelled` flag is checked before
+/// every read so a SIGINT handler can stop the copy cleanly.
 pub fn chunked_copy_with_progress(
-    _src: &mut fs_err::File,
-    _dst: &mut fs_err::File,
+    src: &mut fs_err::File,
+    dst: &mut fs_err::File,
     _file_size: u64,
-    _buffer_size: usize,
-    _bytes_copied: &Arc<AtomicU64>,
-    _cancelled: &AtomicBool,
+    buffer_size: usize,
+    bytes_copied: &Arc<AtomicU64>,
+    cancelled: &AtomicBool,
 ) -> Result<u64, CopyError> {
-    // Stub — returns cancelled to make tests fail meaningfully
-    Err(CopyError::Cancelled)
+    let mut buf = vec![0u8; buffer_size];
+    let mut total: u64 = 0;
+
+    loop {
+        // Check cancel flag between chunks (D-10)
+        if cancelled.load(Ordering::Relaxed) {
+            return Err(CopyError::Cancelled);
+        }
+
+        let n = src.read(&mut buf).map_err(CopyError::Io)?;
+        if n == 0 {
+            break;
+        }
+
+        dst.write_all(&buf[..n]).map_err(CopyError::Io)?;
+
+        total += n as u64;
+
+        // Lock-free progress update (D-06): increment atomic counter;
+        // the progress display thread reads it every 100ms.
+        bytes_copied.fetch_add(n as u64, Ordering::Relaxed);
+    }
+
+    dst.flush().map_err(CopyError::Io)?;
+    Ok(total)
 }
 
 // ── Tests ──────────────────────────────────────────────────────────
@@ -29,13 +53,13 @@ pub fn chunked_copy_with_progress(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Read, Seek, Write};
+    use std::io::Write;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::Arc;
     use tempfile::NamedTempFile;
 
-    /// Helper: create a temp file filled with `len` copies of `byte`,
-    /// returned as an `fs_err::File` open for reading.
+    /// Helper: create a temp file filled with `data`, returned as an
+    /// `fs_err::File` open for reading.
     fn create_source_file(data: &[u8]) -> (NamedTempFile, fs_err::File) {
         let mut tmp = NamedTempFile::new().unwrap();
         tmp.write_all(data).unwrap();
@@ -120,7 +144,7 @@ mod tests {
         // shared AtomicBool so external code (SIGINT handler) can
         // set it between chunks. The real mid-copy cancel is verified
         // in Task 3 integration tests.
-        let _ = (&src, &dst);
+        let _ = (&mut src, &mut dst);
         assert!(!cancelled.load(Ordering::Relaxed));
         assert_eq!(bytes_copied.load(Ordering::Relaxed), 0);
     }

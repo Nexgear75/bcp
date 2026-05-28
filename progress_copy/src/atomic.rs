@@ -2,26 +2,115 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::Arc;
 
+use anyhow::Context;
+use tempfile::Builder;
+
+use crate::copy;
+
 /// Copy `src_path` to `dest_path` using an atomic-write pattern:
 ///
 /// 1. Create a temp file in `dest_path.parent()` (same filesystem
-///    for atomic rename — avoids EXDEV).
+///    for atomic `rename` — avoids EXDEV, Pitfall #2).
 /// 2. Copy all data in chunks via `chunked_copy_with_progress`.
-/// 3. Platform-appropriate fsync (F_FULLFSYNC on macOS,
-///    `sync_all` on Linux).
+/// 3. Platform-appropriate fsync (F_FULLFSYNC on macOS, `sync_all`
+///    on Linux, Pitfall #1).
 /// 4. `persist()` the temp file to `dest_path` — destination is never
-///    written directly.
+///    written directly (ATOM-04).
 ///
 /// Returns the total number of bytes copied.
 pub fn atomic_copy(
-    _src_path: &Path,
-    _dest_path: &Path,
-    _buffer_size: usize,
-    _bytes_copied: &Arc<AtomicU64>,
-    _cancelled: &AtomicBool,
+    src_path: &Path,
+    dest_path: &Path,
+    buffer_size: usize,
+    bytes_copied: &Arc<AtomicU64>,
+    cancelled: &AtomicBool,
 ) -> anyhow::Result<u64> {
-    // Stub — returns 0 to make tests fail
-    Ok(0)
+    // 1. Determine destination directory (Pitfall #2: must be same
+    //    filesystem as dest to avoid EXDEV on rename).
+    let dest_dir = dest_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("Destination has no parent directory: {}", dest_path.display()))?;
+
+    // 2. Create temp file adjacent to destination (Pitfall #2: same
+    //    filesystem as dest → atomic rename, no EXDEV).
+    let prefix = format!(
+        ".{}.",
+        dest_path
+            .file_name()
+            .map(|n| n.to_string_lossy())
+            .unwrap_or_default()
+    );
+    let tmp = Builder::new()
+        .prefix(&prefix)
+        .tempfile_in(dest_dir)
+        .context("Failed to create temporary file")?;
+
+    // Open an fs_err::File handle to the temp file for the chunked
+    // copy (chunked_copy_with_progress expects fs_err::File).
+    let tmp_path = tmp.path().to_path_buf();
+    let mut tmp_file = fs_err::OpenOptions::new()
+        .write(true)
+        .open(&tmp_path)
+        .context("Failed to open temp file for writing")?;
+
+    // 3. Open source file.
+    let mut src_file = fs_err::File::open(src_path)
+        .with_context(|| format!("Failed to open source: {}", src_path.display()))?;
+    let file_size = src_file
+        .metadata()
+        .with_context(|| format!("Failed to read metadata for: {}", src_path.display()))?
+        .len();
+
+    // 4. Copy data in chunks with progress tracking.
+    let total = copy::chunked_copy_with_progress(
+        &mut src_file,
+        &mut tmp_file,
+        file_size,
+        buffer_size,
+        bytes_copied,
+        cancelled,
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
+
+    // Drop the write handle so sync sees all data.
+    drop(tmp_file);
+
+    // 5. Platform-appropriate fsync before rename (ATOM-02).
+    sync_file(tmp.as_file())
+        .context("Failed to sync temporary file to disk")?;
+
+    // 6. Atomic rename: destination appears ONLY when copy is complete
+    //    (ATOM-04). If this fails the temp file is cleaned up by Drop.
+    tmp.persist(dest_path)
+        .map_err(|e| anyhow::anyhow!("Atomic rename failed: {}", e))?;
+
+    Ok(total)
+}
+
+/// Flush file data to persistent storage.
+///
+/// On macOS: uses `fcntl(fd, F_FULLFSYNC)` which guarantees data reaches
+/// physical media. `fsync()` on macOS only flushes to the drive's write
+/// cache and is NOT sufficient (Pitfall #1).
+///
+/// On Linux: uses `sync_all()` which calls `fsync()` and is sufficient.
+#[cfg(target_os = "macos")]
+fn sync_file(file: &std::fs::File) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+
+    // F_FULLFSYNC = 51 on macOS (verified on macOS 15, RESEARCH.md)
+    const F_FULLFSYNC: i32 = 51;
+
+    let rc = unsafe { libc::fcntl(file.as_raw_fd(), F_FULLFSYNC) };
+    if rc == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn sync_file(file: &std::fs::File) -> std::io::Result<()> {
+    file.sync_all()
 }
 
 // ── Tests ──────────────────────────────────────────────────────────
