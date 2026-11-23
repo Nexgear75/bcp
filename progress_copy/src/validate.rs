@@ -1,51 +1,113 @@
 use std::path::Path;
 
+use anyhow::Context;
+
 use crate::config::Config;
 use crate::error::CopyError;
 
-/// Check that the source file exists.
+/// Check that the source file exists (PLAN-07).
 pub fn check_source_exists(source: &Path) -> Result<(), CopyError> {
-    // Stub — always returns Ok to make tests fail on missing-source case
-    let _ = source;
+    fs_err::metadata(source).map_err(|_| CopyError::SourceNotFound(source.to_path_buf()))?;
     Ok(())
 }
 
-/// Check that source and destination are not the same file.
-/// Uses `same-file::is_same_file()` to compare device + inode (PLAN-06).
+/// Check that source and destination are not the same file (PLAN-06).
+/// Uses `same-file::is_same_file()` to compare device + inode.
 pub fn check_self_copy(source: &Path, dest: &Path) -> Result<(), CopyError> {
-    // Stub — always returns Ok to make tests fail on self-copy case
-    let _ = (source, dest);
+    if same_file::is_same_file(source, dest).unwrap_or(false) {
+        return Err(CopyError::SelfCopy(source.to_path_buf()));
+    }
     Ok(())
 }
 
-/// Check that the destination parent directory is writable.
+/// Check that the destination parent directory is writable (PLAN-08).
+///
+/// Strategy: if `dest` is an existing file, check its permissions.
+/// If `dest` does not exist, attempt a test-write to `dest.parent()`.
 pub fn check_dest_writable(dest: &Path) -> Result<(), CopyError> {
-    // Stub — always returns Ok to make tests fail on unwritable case
-    let _ = dest;
-    Ok(())
+    // If dest exists and is a file, check if it's writable
+    if let Ok(metadata) = fs_err::metadata(dest) {
+        if metadata.permissions().readonly() {
+            return Err(CopyError::DestinationNotWritable(dest.to_path_buf()));
+        }
+        return Ok(());
+    }
+
+    // Dest does not exist — verify we can create a file in its parent
+    let parent = dest.parent().unwrap_or(Path::new("."));
+    fs_err::metadata(parent).map_err(|_| {
+        CopyError::DestinationNotWritable(dest.to_path_buf())
+    })?;
+
+    // Test-write to the parent directory
+    let test_file = parent.join("_bcp_write_test");
+    match std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&test_file)
+    {
+        Ok(f) => {
+            drop(f);
+            let _ = std::fs::remove_file(&test_file);
+            Ok(())
+        }
+        Err(_) => Err(CopyError::DestinationNotWritable(dest.to_path_buf())),
+    }
 }
 
-/// Check overwrite policy respecting -f and -n flags.
+/// Check overwrite policy per `-f` and `-n` flags.
+///
+/// - If dest does not exist: always Ok.
+/// - If dest exists and `no_clobber`: Err(DestinationExists).
+/// - If dest exists and `force`: Ok (allow overwrite).
+/// - If dest exists and neither flag: Err(DestinationExists).
 pub fn check_overwrite(dest: &Path, force: bool, no_clobber: bool) -> Result<(), CopyError> {
-    // Stub — always returns Ok to make tests fail on no-clobber case
-    let _ = (dest, force, no_clobber);
+    if dest.exists() {
+        if no_clobber {
+            return Err(CopyError::DestinationExists(dest.to_path_buf()));
+        }
+        if !force {
+            return Err(CopyError::DestinationExists(dest.to_path_buf()));
+        }
+        // force && !no_clobber: allow overwrite
+    }
     Ok(())
 }
 
-/// Validate that the Config flags don't conflict.
+/// Validate that Config flags don't conflict.
+/// `-f` (force) and `-n` (no-clobber) are mutually exclusive.
 pub fn validate_flags(config: &Config) -> anyhow::Result<()> {
-    // Stub — always returns Ok to make tests fail on conflicting flags
-    let _ = config;
+    if config.force && config.no_clobber {
+        anyhow::bail!(
+            "Conflicting flags: -f (force) and -n (no-clobber) cannot be used together"
+        );
+    }
     Ok(())
 }
 
-/// Run all pre-flight checks.
+/// Run all pre-flight checks in order.
+/// Returns early with the first error encountered.
 pub fn run_preflight(config: &Config) -> anyhow::Result<()> {
     validate_flags(config)?;
-    check_source_exists(&config.source)?;
-    check_self_copy(&config.source, &config.destination)?;
-    check_overwrite(&config.destination, config.force, config.no_clobber)?;
-    check_dest_writable(&config.destination)?;
+
+    check_source_exists(&config.source)
+        .with_context(|| format!("Source not found: {}", config.source.display()))?;
+
+    check_self_copy(&config.source, &config.destination)
+        .with_context(|| "Source and destination are the same file".to_string())?;
+
+    check_overwrite(&config.destination, config.force, config.no_clobber)
+        .with_context(|| format!(
+            "Destination exists: {} (use -f to overwrite)",
+            config.destination.display()
+        ))?;
+
+    check_dest_writable(&config.destination)
+        .with_context(|| format!(
+            "Cannot write to destination: {}",
+            config.destination.display()
+        ))?;
+
     Ok(())
 }
 
@@ -54,7 +116,6 @@ pub fn run_preflight(config: &Config) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
     use std::path::PathBuf;
     use tempfile::{NamedTempFile, TempDir};
 

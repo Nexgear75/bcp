@@ -3,9 +3,14 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 
+use crate::config::ProgressMode;
 use crate::signals::CancelState;
+use crate::types::CopyCounters;
+
+/// Filled / edge / empty glyphs for all block bars (classic boxed look).
+const BAR_CHARS: &str = "█▓░";
 
 /// Create a `ProgressBar` configured for single-file copy display.
 ///
@@ -28,12 +33,12 @@ pub fn create_progress_bar(file_size: u64, source_name: &str) -> ProgressBar {
     // - {eta} → estimated time remaining (computed by indicatif)
     bar.set_style(
         ProgressStyle::with_template(
-            "{msg} [{bar:30}] {percent:>3}% | \
-             {decimal_bytes}/{decimal_total_bytes} | \
-             {decimal_bytes_per_sec} | ETA: {eta}",
+            "{msg:.bold} ┃{bar:30.green}┃ {percent:>3}% │ \
+             {decimal_bytes}/{decimal_total_bytes} │ \
+             {decimal_bytes_per_sec} │ ETA {eta}",
         )
         .unwrap()
-        .progress_chars("=> "),
+        .progress_chars(BAR_CHARS),
     );
 
     bar.set_message(source_name.to_string());
@@ -67,13 +72,171 @@ pub fn spawn_progress_ticker(
         // known file size).  Without this the thread spins forever and
         // `ticker.join()` in the main thread deadlocks on normal (non-
         // cancelled) completion.
-        if let Some(end) = total {
-            if current >= end {
+        if let Some(end) = total
+            && current >= end {
                 break;
             }
-        }
         std::thread::sleep(Duration::from_millis(100));
     })
+}
+
+/// Create an indeterminate spinner for a silent preparation phase
+/// (planning, analysis…). Animates via a steady tick so the user sees the
+/// tool is working even when no per-item update is emitted.
+///
+/// Returns a hidden bar in `Silent` mode.
+pub fn phase_spinner(message: &str, mode: ProgressMode) -> ProgressBar {
+    if mode == ProgressMode::Silent {
+        return ProgressBar::hidden();
+    }
+    let pb = ProgressBar::new_spinner();
+    pb.set_draw_target(ProgressDrawTarget::stderr_with_hz(10));
+    pb.set_style(
+        ProgressStyle::with_template("{spinner:.green} {msg} [{elapsed_precise}]")
+            .unwrap()
+            .tick_chars("◐◓◑◒ "),
+    );
+    pb.set_message(message.to_string());
+    pb.enable_steady_tick(Duration::from_millis(100));
+    pb
+}
+
+// ── Multi-file progress (Phase 2/3) ─────────────────────────────────
+
+/// Handle to a multi-bar display: preparation + total bytes + file count.
+pub struct MultiDisplay {
+    pub multi: MultiProgress,
+    /// Transient bar shown while destination directories are being created.
+    /// Cleared once preparation completes so only the copy bars remain.
+    pub dirs_bar: Option<ProgressBar>,
+    pub total_bar: ProgressBar,
+    pub files_bar: ProgressBar,
+    mode: ProgressMode,
+}
+
+/// Build a multi-bar display for a tree copy.
+///
+/// - `Rich`: a total-bytes bar plus an `N/M files` bar.
+/// - `Quiet`: a single compact total-bytes line.
+/// - `Silent`: fully hidden.
+pub fn create_multi_progress(
+    total_bytes: u64,
+    total_files: u64,
+    total_dirs: u64,
+    mode: ProgressMode,
+) -> MultiDisplay {
+    let multi = MultiProgress::new();
+    if mode == ProgressMode::Silent {
+        multi.set_draw_target(ProgressDrawTarget::hidden());
+    } else {
+        multi.set_draw_target(ProgressDrawTarget::stderr_with_hz(10));
+    }
+
+    // Transient preparation bar: only in Rich mode, and only when there are
+    // directories to create (added first so it renders on top, then cleared).
+    let dirs_bar = if mode == ProgressMode::Rich && total_dirs > 0 {
+        let bar = multi.add(ProgressBar::new(total_dirs));
+        bar.set_style(
+            ProgressStyle::with_template("Prep  ┃{bar:30.cyan}┃ {pos}/{len} dossiers")
+                .unwrap()
+                .progress_chars(BAR_CHARS),
+        );
+        bar.enable_steady_tick(Duration::from_millis(100));
+        Some(bar)
+    } else {
+        None
+    };
+
+    let total_bar = multi.add(ProgressBar::new(total_bytes));
+    let files_bar = multi.add(ProgressBar::new(total_files));
+
+    if mode == ProgressMode::Quiet || mode == ProgressMode::Silent {
+        total_bar.set_style(
+            ProgressStyle::with_template(
+                "{percent:>3}% │ {decimal_bytes}/{decimal_total_bytes} │ \
+                 {decimal_bytes_per_sec} │ ETA {eta} │ {pos}/{len} files",
+            )
+            .unwrap(),
+        );
+        // In quiet mode the single total bar carries the file count too.
+        files_bar.set_draw_target(ProgressDrawTarget::hidden());
+    } else {
+        total_bar.set_style(
+            ProgressStyle::with_template(
+                "Bytes ┃{bar:30.green}┃ {percent:>3}% │ \
+                 {decimal_bytes}/{decimal_total_bytes} │ \
+                 {decimal_bytes_per_sec} │ ETA {eta}",
+            )
+            .unwrap()
+            .progress_chars(BAR_CHARS),
+        );
+        files_bar.set_style(
+            ProgressStyle::with_template("Files ┃{bar:30.green}┃ {pos}/{len}")
+                .unwrap()
+                .progress_chars(BAR_CHARS),
+        );
+    }
+
+    total_bar.enable_steady_tick(Duration::from_millis(100));
+    MultiDisplay { multi, dirs_bar, total_bar, files_bar, mode }
+}
+
+impl MultiDisplay {
+    /// Spawn a ticker that mirrors the shared counters onto the bars every
+    /// 100ms, exiting when cancelled or when both targets are reached.
+    pub fn spawn_ticker(
+        &self,
+        counters: CopyCounters,
+        cancel: Arc<CancelState>,
+    ) -> JoinHandle<()> {
+        let total_bar = self.total_bar.clone();
+        let files_bar = self.files_bar.clone();
+        let dirs_bar = self.dirs_bar.clone();
+        let total_bytes = total_bar.length();
+        let total_files = files_bar.length();
+        let total_dirs = dirs_bar.as_ref().and_then(|b| b.length());
+        std::thread::spawn(move || {
+            let mut dirs_cleared = false;
+            loop {
+            let bytes = counters.bytes_copied.load(Ordering::Relaxed);
+            let files = counters.files_done.load(Ordering::Relaxed);
+            total_bar.set_position(bytes);
+            files_bar.set_position(files);
+
+            // Mirror the directory-creation progress, then clear the prep bar
+            // once every directory exists so only the copy bars remain.
+            if let (Some(bar), Some(total)) = (dirs_bar.as_ref(), total_dirs)
+                && !dirs_cleared {
+                    let dirs = counters.dirs_done.load(Ordering::Relaxed);
+                    bar.set_position(dirs);
+                    if dirs >= total {
+                        bar.finish_and_clear();
+                        dirs_cleared = true;
+                    }
+                }
+
+            if cancel.cancelled.load(Ordering::Relaxed) {
+                break;
+            }
+            let bytes_done = total_bytes.map(|t| bytes >= t).unwrap_or(true);
+            let files_done = total_files.map(|t| files >= t).unwrap_or(true);
+            if bytes_done && files_done {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+            }
+        })
+    }
+
+    /// Clear the bars at the end of an operation.
+    pub fn finish(&self) {
+        if let Some(bar) = &self.dirs_bar {
+            bar.finish_and_clear();
+        }
+        self.total_bar.finish_and_clear();
+        self.files_bar.finish_and_clear();
+        let _ = self.mode;
+    }
 }
 
 // ── Tests ──────────────────────────────────────────────────────────

@@ -7,6 +7,7 @@ edition = "2024"
 progress_copy = { path = "../progress_copy" }
 clap = { version = "4.6.1", features = ["derive"] }
 anyhow = "1.0.102"
+console = "0.16.3"
 
 [dev-dependencies]
 assert_cmd = "2.2.2"

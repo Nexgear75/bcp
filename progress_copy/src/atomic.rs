@@ -95,7 +95,7 @@ pub fn atomic_copy(
 ///
 /// On Linux: uses `sync_all()` which calls `fsync()` and is sufficient.
 #[cfg(target_os = "macos")]
-fn sync_file(file: &std::fs::File) -> std::io::Result<()> {
+pub(crate) fn sync_file(file: &std::fs::File) -> std::io::Result<()> {
     use std::os::unix::io::AsRawFd;
 
     // F_FULLFSYNC = 51 on macOS (verified on macOS 15, RESEARCH.md)
@@ -109,7 +109,7 @@ fn sync_file(file: &std::fs::File) -> std::io::Result<()> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn sync_file(file: &std::fs::File) -> std::io::Result<()> {
+pub(crate) fn sync_file(file: &std::fs::File) -> std::io::Result<()> {
     file.sync_all()
 }
 
