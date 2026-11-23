@@ -1,122 +1,176 @@
 //! Phase 2 of the pipeline: turn scanned entries into an executable
-//! [`CopyPlan`], applying self-copy detection, overwrite policy, clone
-//! eligibility, and a disk-space pre-flight check.
+//! [`CopyPlan`]: self-copy detection, overwrite policy, hardlink grouping,
+//! clone eligibility, and a disk-space check.
 
+use std::collections::HashMap;
+use std::io::{BufRead, Write};
 use std::os::unix::fs::MetadataExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use anyhow::Context;
-
-use crate::config::Config;
+use crate::config::{Config, Overwrite};
 use crate::error::CopyError;
 use crate::scan::ScanResult;
-use crate::types::{CopyPlan, FileKind};
+use crate::types::{CopyPlan, EntryJob, FileEntry, FileJob, FileKind, LinkJob};
 
-/// Build a [`CopyPlan`] from a scan result for the given destination.
-pub fn build_plan(scan: ScanResult, dest: &Path, config: &Config) -> anyhow::Result<CopyPlan> {
-    let mut plan = CopyPlan {
-        scan_warnings: scan.warnings,
-        ..Default::default()
-    };
+/// Outcome of the overwrite policy for one entry.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Decision {
+    /// Go ahead; `replace` = an existing destination will be replaced.
+    Proceed { replace: bool },
+    /// Leave the destination alone.
+    Skip,
+}
 
-    // Device id of the destination root, used for clone eligibility.
-    let dest_device = dest_device_id(dest);
+/// Apply the overwrite policy (`-f`, `-n`, `-i`, `-u`) to an existing
+/// destination described by `dest_meta`.
+///
+/// # Errors
+/// `DestinationExists` when refusing, or a type mismatch (dir vs non-dir).
+pub fn decide(entry: &FileEntry, dest: &Path, dest_meta: Option<&std::fs::Metadata>, config: &Config, tool: &str) -> anyhow::Result<Decision> {
+    let Some(dm) = dest_meta else { return Ok(Decision::Proceed { replace: false }) };
 
+    if dm.is_dir() && entry.kind != FileKind::Directory {
+        anyhow::bail!("cannot overwrite directory '{}' with non-directory", dest.display());
+    }
+    if config.overwrite == Overwrite::Skip {
+        return Ok(Decision::Skip);
+    }
+    if config.update {
+        let src_m = (entry.meta.mtime(), entry.meta.mtime_nsec());
+        let dst_m = (dm.mtime(), dm.mtime_nsec());
+        if dst_m >= src_m {
+            return Ok(Decision::Skip);
+        }
+    }
+    match config.overwrite {
+        Overwrite::Force => Ok(Decision::Proceed { replace: true }),
+        Overwrite::Prompt => {
+            if prompt(&format!("{tool}: overwrite '{}'? ", dest.display())) {
+                Ok(Decision::Proceed { replace: true })
+            } else {
+                Ok(Decision::Skip)
+            }
+        }
+        // `-u` alone means "replace older destinations".
+        Overwrite::Refuse if config.update => Ok(Decision::Proceed { replace: true }),
+        Overwrite::Refuse => Err(CopyError::DestinationExists(dest.to_path_buf()).into()),
+        Overwrite::Skip => Ok(Decision::Skip),
+    }
+}
+
+/// Ask a yes/no question on stderr, read the answer from stdin.
+#[must_use]
+pub fn prompt(question: &str) -> bool {
+    let mut err = std::io::stderr();
+    let _ = write!(err, "{question}");
+    let _ = err.flush();
+    let mut line = String::new();
+    if std::io::stdin().lock().read_line(&mut line).is_err() {
+        return false;
+    }
+    matches!(line.trim_start().chars().next(), Some('y' | 'Y'))
+}
+
+/// Build a [`CopyPlan`] from a scan result. `dest` is the destination
+/// operand (used for clone eligibility and the disk-space check).
+///
+/// # Errors
+/// Self-copy, refused overwrite, type mismatch, or not enough disk space.
+pub fn build_plan(scan: ScanResult, dest: &Path, config: &Config, tool: &str) -> anyhow::Result<CopyPlan> {
+    let mut plan = CopyPlan { scan_warnings: scan.warnings, ..Default::default() };
+
+    let dest_device = std::fs::metadata(nearest_existing(dest)).ok().map(|m| m.dev());
     let clone_ok = !config.no_clone && crate::platform::clone_supported();
+    // (dev, ino) → destination of the first copy, for hardlinks.
+    let mut first_copy: HashMap<(u64, u64), PathBuf> = HashMap::new();
 
     for scanned in scan.entries {
         let entry = scanned.entry;
         let dest_path = scanned.dest_path;
-
-        // Single `lstat` of the destination entry, reused for both the
-        // self-copy guard and the overwrite policy. This avoids the extra
-        // source+dest stats `same_file::is_same_file` performed per entry:
-        // in the dominant case (a move onto a fresh destination) it's one
-        // syscall that fails fast with ENOENT instead of three.
         let dest_meta = std::fs::symlink_metadata(&dest_path).ok();
 
-        // Self-copy guard (same device + inode) — a hard error, matching
-        // `cp` ("'x' and 'x' are the same file"). The source device/inode were
-        // already captured during the scan, so no extra source stat is needed.
+        // Self-copy guard (same device + inode), like cp's "are the same file".
         if let Some(dm) = &dest_meta
-            && dm.dev() == entry.device_id
-            && dm.ino() == entry.inode
+            && dm.dev() == entry.device_id()
+            && dm.ino() == entry.inode()
         {
             return Err(CopyError::SelfCopy(entry.source_path.clone()).into());
         }
 
-        match &entry.kind {
-            FileKind::Directory => {
-                plan.dirs_to_create.push(dest_path);
-            }
-            FileKind::Symlink { .. } => {
-                // Overwrite policy applies to existing destinations.
-                check_overwrite_meta(&dest_path, dest_meta.as_ref(), config)?;
-                plan.symlinks.push((entry, dest_path));
-            }
-            FileKind::File => {
-                check_overwrite_meta(&dest_path, dest_meta.as_ref(), config)?;
-                plan.total_bytes += entry.size;
-                plan.total_files += 1;
-
-                let cloneable = clone_ok
-                    && dest_device.is_some()
-                    && Some(entry.device_id) == dest_device;
-                if cloneable {
-                    plan.files_to_clone.push((entry, dest_path));
-                } else {
-                    plan.files_to_copy.push((entry, dest_path));
+        if entry.kind == FileKind::Directory {
+            if let Some(dm) = &dest_meta {
+                let is_dir = dm.is_dir() || std::fs::metadata(&dest_path).map(|m| m.is_dir()).unwrap_or(false);
+                if !is_dir {
+                    anyhow::bail!(
+                        "cannot overwrite non-directory '{}' with directory '{}'",
+                        dest_path.display(),
+                        entry.source_path.display()
+                    );
                 }
             }
-            FileKind::Other => {}
+            plan.dirs.push(EntryJob { entry, dest: dest_path, replace: dest_meta.is_some() });
+            continue;
+        }
+
+        let replace = match decide(&entry, &dest_path, dest_meta.as_ref(), config, tool)? {
+            Decision::Skip => {
+                plan.skipped.push(dest_path);
+                continue;
+            }
+            Decision::Proceed { replace } => replace,
+        };
+
+        match entry.kind {
+            FileKind::Symlink { .. } => plan.symlinks.push(EntryJob { entry, dest: dest_path, replace }),
+            FileKind::Fifo => plan.fifos.push(EntryJob { entry, dest: dest_path, replace }),
+            FileKind::File => {
+                if entry.meta.nlink() > 1 {
+                    let key = (entry.device_id(), entry.inode());
+                    if let Some(target) = first_copy.get(&key) {
+                        plan.hardlinks.push(LinkJob { entry, dest: dest_path, target: target.clone(), replace });
+                        continue;
+                    }
+                    first_copy.insert(key, dest_path.clone());
+                }
+                plan.total_bytes += entry.size();
+                plan.total_files += 1;
+                let clone = clone_ok && dest_device == Some(entry.device_id());
+                plan.files.push(FileJob { entry, dest: dest_path, clone, replace });
+            }
+            FileKind::Directory | FileKind::Other => {}
         }
     }
 
-    // Disk-space pre-flight: clones share blocks (CoW) so only the
-    // truly-copied bytes need free space.
-    let needed: u64 = plan.files_to_copy.iter().map(|(e, _)| e.size).sum();
-    check_disk_space(dest, needed)
-        .with_context(|| "Insufficient disk space for this transfer")?;
+    // Largest files first: the long transfers start early and the small ones
+    // fill the gaps, so all workers finish at about the same time.
+    plan.files.sort_by_key(|j| std::cmp::Reverse(j.entry.size()));
+
+    // Clones share blocks (CoW); sparse files only need their allocated bytes.
+    let needed: u64 = plan
+        .files
+        .iter()
+        .filter(|j| !j.clone)
+        .map(|j| if j.entry.is_sparse() { j.entry.allocated() } else { j.entry.size() })
+        .sum();
+    check_disk_space(dest, needed)?;
 
     Ok(plan)
 }
 
-/// Device id of `dest` (or its nearest existing ancestor).
-fn dest_device_id(dest: &Path) -> Option<u64> {
-    std::fs::metadata(nearest_existing(dest)).ok().map(|m| m.dev())
-}
-
-/// Apply the overwrite policy from an already-fetched destination `lstat`.
-///
-/// An existing destination is an error unless `-f` (force) is set and `-n`
-/// (no-clobber) is not. `validate_flags` already rejects `-f` + `-n`. The
-/// metadata comes from `symlink_metadata`, so a symlink at the destination is
-/// treated as the entry itself, not its target.
-fn check_overwrite_meta(
-    dest: &Path,
-    dest_meta: Option<&std::fs::Metadata>,
-    config: &Config,
-) -> anyhow::Result<()> {
-    if dest_meta.is_some() && (config.no_clobber || !config.force) {
-        return Err(CopyError::DestinationExists(dest.to_path_buf()).into());
-    }
-    Ok(())
-}
-
 /// Verify the destination filesystem has at least `needed` free bytes.
 ///
-/// Uses `statvfs` via `nix`; failures to query are treated as "unknown"
-/// and allowed through rather than blocking a copy.
+/// # Errors
+/// When the space is known to be insufficient.
 pub fn check_disk_space(dest: &Path, needed: u64) -> anyhow::Result<()> {
     if needed == 0 {
         return Ok(());
     }
-    let probe = nearest_existing(dest);
-    if let Ok(stat) = nix::sys::statvfs::statvfs(&probe) {
-        let avail = stat.blocks_available() as u64 * stat.fragment_size();
+    if let Ok(stat) = nix::sys::statvfs::statvfs(&nearest_existing(dest)) {
+        #[allow(clippy::useless_conversion)]
+        let avail = u64::from(stat.blocks_available()).saturating_mul(u64::from(stat.fragment_size()));
         if avail < needed {
             anyhow::bail!(
-                "need {} but only {} available on destination filesystem",
+                "not enough space on destination: need {} but only {} available",
                 bytesize::ByteSize(needed),
                 bytesize::ByteSize(avail),
             );
@@ -125,17 +179,88 @@ pub fn check_disk_space(dest: &Path, needed: u64) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn nearest_existing(dest: &Path) -> std::path::PathBuf {
+/// `dest` or its nearest existing ancestor.
+#[must_use]
+pub fn nearest_existing(dest: &Path) -> PathBuf {
     let mut p = dest;
     loop {
         if p.exists() {
             return p.to_path_buf();
         }
         match p.parent() {
-            // An empty parent ("") means the current directory.
-            Some(parent) if parent.as_os_str().is_empty() => return std::path::PathBuf::from("."),
+            Some(parent) if parent.as_os_str().is_empty() => return PathBuf::from("."),
             Some(parent) => p = parent,
-            None => return std::path::PathBuf::from("."),
+            None => return PathBuf::from("."),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry_for(path: &Path) -> FileEntry {
+        FileEntry {
+            source_path: path.to_path_buf(),
+            relative_path: PathBuf::new(),
+            meta: std::fs::symlink_metadata(path).unwrap(),
+            kind: FileKind::File,
+        }
+    }
+
+    #[test]
+    fn policy_matrix() {
+        let d = tempfile::tempdir().unwrap();
+        let src = d.path().join("s");
+        let dst = d.path().join("d");
+        std::fs::write(&src, b"new").unwrap();
+        std::fs::write(&dst, b"old").unwrap();
+        let e = entry_for(&src);
+        let dm = std::fs::metadata(&dst).unwrap();
+        let cfg = |o| Config { overwrite: o, ..Default::default() };
+
+        assert_eq!(decide(&e, &dst, None, &cfg(Overwrite::Refuse), "t").unwrap(), Decision::Proceed { replace: false });
+        assert!(decide(&e, &dst, Some(&dm), &cfg(Overwrite::Refuse), "t").is_err());
+        assert_eq!(decide(&e, &dst, Some(&dm), &cfg(Overwrite::Force), "t").unwrap(), Decision::Proceed { replace: true });
+        assert_eq!(decide(&e, &dst, Some(&dm), &cfg(Overwrite::Skip), "t").unwrap(), Decision::Skip);
+    }
+
+    #[test]
+    fn update_compares_mtimes() {
+        let d = tempfile::tempdir().unwrap();
+        let src = d.path().join("s");
+        let dst = d.path().join("d");
+        std::fs::write(&src, b"new").unwrap();
+        std::fs::write(&dst, b"old").unwrap();
+        let old = filetime::FileTime::from_unix_time(1_000_000_000, 0);
+        let new = filetime::FileTime::from_unix_time(1_500_000_000, 0);
+        let up = Config { update: true, ..Default::default() };
+
+        filetime::set_file_times(&src, new, new).unwrap();
+        filetime::set_file_times(&dst, old, old).unwrap();
+        let dm = std::fs::metadata(&dst).unwrap();
+        assert_eq!(decide(&entry_for(&src), &dst, Some(&dm), &up, "t").unwrap(), Decision::Proceed { replace: true });
+
+        filetime::set_file_times(&src, old, old).unwrap();
+        filetime::set_file_times(&dst, new, new).unwrap();
+        let dm = std::fs::metadata(&dst).unwrap();
+        assert_eq!(decide(&entry_for(&src), &dst, Some(&dm), &up, "t").unwrap(), Decision::Skip);
+    }
+
+    #[test]
+    fn file_over_directory_refused() {
+        let d = tempfile::tempdir().unwrap();
+        let src = d.path().join("s");
+        std::fs::write(&src, b"x").unwrap();
+        let dm = std::fs::metadata(d.path()).unwrap();
+        let force = Config { overwrite: Overwrite::Force, ..Default::default() };
+        assert!(decide(&entry_for(&src), d.path(), Some(&dm), &force, "t").is_err());
+    }
+
+    #[test]
+    fn disk_space_check() {
+        let d = tempfile::tempdir().unwrap();
+        assert!(check_disk_space(d.path(), 1).is_ok());
+        assert!(check_disk_space(d.path(), u64::MAX).is_err());
     }
 }

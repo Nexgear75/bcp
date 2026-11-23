@@ -6,8 +6,6 @@
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::thread;
-use std::time::Duration;
 
 use progress_copy::copy::chunked_copy_with_progress;
 use progress_copy::error::CopyError;
@@ -120,52 +118,37 @@ fn test_chunked_copy_cancel_before_start() {
 
 // ── Test: mid-copy cancellation (after first chunk) ────────────────
 
+/// Reader that raises the cancel flag right after serving its first chunk,
+/// making the mid-copy cancellation deterministic (no timing race).
+struct CancelAfterFirstRead<'a, R> {
+    inner: R,
+    flag: &'a AtomicBool,
+}
+
+impl<R: std::io::Read> std::io::Read for CancelAfterFirstRead<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.flag.store(true, Ordering::Relaxed);
+        Ok(n)
+    }
+}
+
 #[test]
 fn test_chunked_copy_cancel_after_first_chunk() {
     let data = vec![0x55u8; 16384]; // 16 KB
-    let (_src_tmp, mut src) = create_source_file(&data);
+    let (_src_tmp, src) = create_source_file(&data);
     let (_dst_tmp, mut dst) = create_dest_file();
     let bytes_copied = Arc::new(AtomicU64::new(0));
     let cancelled = AtomicBool::new(false);
+    let mut src = CancelAfterFirstRead { inner: src, flag: &cancelled };
 
-    // Use a small buffer (8 bytes) to ensure we get many chunks,
-    // then cancel after the copy has started making progress.
-    let buffer_size: usize = 8;
+    let result = chunked_copy_with_progress(&mut src, &mut dst, data.len() as u64, 8, &bytes_copied, &cancelled);
 
-    // Run the copy in a scoped thread so we can cancel mid-way.
-    thread::scope(|s| {
-        let bytes_ref = &bytes_copied;
-        let cancel_ref = &cancelled;
-
-        let handle = s.spawn(move || {
-            chunked_copy_with_progress(
-                &mut src, &mut dst,
-                data.len() as u64,
-                buffer_size,
-                bytes_ref,
-                cancel_ref,
-            )
-        });
-
-        // Wait for at least some bytes to be copied (first chunk).
-        while bytes_copied.load(Ordering::Relaxed) == 0 {
-            thread::sleep(Duration::from_millis(1));
-        }
-        // Now cancel — the next loop iteration will see it.
-        cancelled.store(true, Ordering::Relaxed);
-
-        let result = handle.join().unwrap();
-        assert!(result.is_err(), "Expected Err(Cancelled) after mid-copy cancel");
-        match result.unwrap_err() {
-            CopyError::Cancelled => {} // expected
-            other => panic!("Expected CopyError::Cancelled, got {:?}", other),
-        }
-
-        // Only the bytes from the first (partial) chunk should be copied
-        let copied = bytes_copied.load(Ordering::Relaxed);
-        assert!(copied > 0, "At least one chunk should have been copied");
-        assert!(copied < 16384, "Not all data should have been copied: {copied}");
-    });
+    match result {
+        Err(CopyError::Cancelled) => {}
+        other => panic!("Expected CopyError::Cancelled, got {other:?}"),
+    }
+    assert_eq!(bytes_copied.load(Ordering::Relaxed), 8, "exactly one 8-byte chunk before stopping");
 }
 
 // ── Test: empty file copy ──────────────────────────────────────────

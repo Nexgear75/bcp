@@ -4,24 +4,20 @@ use thiserror::Error;
 /// Errors that can occur during copy operations.
 #[derive(Error, Debug)]
 pub enum CopyError {
-    /// The source file does not exist.
-    #[error("Source not found: {0}")]
+    /// The source does not exist.
+    #[error("cannot stat '{0}': No such file or directory")]
     SourceNotFound(PathBuf),
 
     /// The source and destination are the same file.
-    #[error("Cannot copy file to itself: {0}")]
+    #[error("'{0}' and its destination are the same file")]
     SelfCopy(PathBuf),
 
-    /// The destination exists and no-clobber is set.
-    #[error("Destination exists and -n (no-clobber) is set: {0}")]
+    /// The destination exists and the policy refuses to replace it.
+    #[error("'{0}' already exists (use -f to overwrite, -n to skip, -i to ask, -u to replace older files)")]
     DestinationExists(PathBuf),
 
-    /// The destination path cannot be written to.
-    #[error("Cannot write to destination: {0}")]
-    DestinationNotWritable(PathBuf),
-
-    /// The copy was cancelled by the user (SIGINT).
-    #[error("Copy cancelled by user")]
+    /// The copy was cancelled (Ctrl+C, or `--strict` after a failure).
+    #[error("cancelled")]
     Cancelled,
 
     /// A standard I/O error occurred.

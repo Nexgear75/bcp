@@ -5,27 +5,33 @@ use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
+/// `<sys/clonefile.h>`: do not follow a symlink at `src`.
+const CLONE_NOFOLLOW: u32 = 0x0001;
+
 /// Clone `src` to `dst` using `clonefile(2)` (APFS copy-on-write).
 ///
-/// This is near-instant and shares physical blocks until one side is
-/// written, with no data duplication. It requires both paths to live on
-/// the same APFS volume; on any failure the caller should fall back to a
-/// regular copy.
+/// Near-instant and shares physical blocks until one side is written.
+/// `dst` must not exist; callers clone to a temp name and rename it into
+/// place. Unless `follow_symlink` (`-L`/`-H`), a symlink at `src` is never
+/// followed (`CLONE_NOFOLLOW`).
 ///
-/// `dst` must NOT already exist (clonefile fails with `EEXIST` otherwise) —
-/// the caller clones to a temp path adjacent to the real destination and
-/// renames it into place to preserve atomicity.
-pub fn clonefile(src: &Path, dst: &Path) -> io::Result<()> {
+/// # Errors
+/// Any `clonefile` error (`ENOTSUP` on non-APFS, `EXDEV` across volumes…).
+pub fn clonefile(src: &Path, dst: &Path, follow_symlink: bool) -> io::Result<()> {
     let src_c = CString::new(src.as_os_str().as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "source path has interior NUL"))?;
     let dst_c = CString::new(dst.as_os_str().as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "dest path has interior NUL"))?;
-
-    // flags = 0: follow symlinks is irrelevant here since we only clone
-    // regular files (the planner filters by kind).
-    let rc = unsafe { libc::clonefile(src_c.as_ptr(), dst_c.as_ptr(), 0) };
+    let flags = if follow_symlink { 0 } else { CLONE_NOFOLLOW };
+    let rc = unsafe { libc::clonefile(src_c.as_ptr(), dst_c.as_ptr(), flags) };
     if rc != 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+/// True for errors meaning "this volume can never clone" (stop trying).
+#[must_use]
+pub fn clone_permanently_unsupported(e: &io::Error) -> bool {
+    matches!(e.raw_os_error(), Some(libc::ENOTSUP | libc::EXDEV))
 }

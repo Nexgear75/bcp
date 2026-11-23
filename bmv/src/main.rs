@@ -1,113 +1,142 @@
-use clap::Parser;
-use progress_copy::{run_move, Config, ProgressMode};
 use std::path::PathBuf;
 
-/// Move files with progress bars — a modern replacement for `mv`.
-#[derive(Parser)]
-#[command(name = "bmv", version, about = "Move files with progress bars")]
-struct Args {
-    /// Force overwrite of destination file
-    #[arg(short = 'f', long, help = "Force overwrite of destination file")]
-    force: bool,
+use clap::{CommandFactory, Parser, ValueEnum, error::ErrorKind};
+use progress_copy::{Config, Overwrite, Preserve, SyncMode, cli, run_move};
 
-    /// Do not overwrite an existing file
-    #[arg(short = 'n', long, help = "Do not overwrite an existing file")]
-    no_clobber: bool,
-
-    /// Verbose output
-    #[arg(short = 'v', long, help = "Verbose output")]
-    verbose: bool,
-
-    /// Number of worker threads for cross-device copy (default: auto)
-    #[arg(short = 't', long, value_name = "N", help = "Worker threads (default: auto)")]
-    threads: Option<usize>,
-
-    /// Read/write buffer size for cross-device copy, e.g. 1M, 256K
-    #[arg(short = 'b', long, value_name = "SIZE", help = "Buffer size, e.g. 1M, 256K")]
-    buffer: Option<String>,
-
-    /// Abort on the first error instead of skipping
-    #[arg(long, help = "Abort on first error instead of skipping")]
-    strict: bool,
-
-    /// Scan and plan only; perform no changes
-    #[arg(long, help = "Scan and plan only; perform no changes")]
-    dry_run: bool,
-
-    /// Minimal single-line progress
-    #[arg(short = 'q', long, help = "Minimal single-line progress")]
-    quiet: bool,
-
-    /// Disable progress output entirely
-    #[arg(long, help = "Disable progress output entirely")]
-    no_progress: bool,
-
-    /// Source paths followed by the destination (last argument)
-    #[arg(required = true, num_args = 2.., value_name = "SOURCES... DEST")]
-    paths: Vec<String>,
+#[derive(Clone, Copy, ValueEnum)]
+enum Sync {
+    /// Same as batch for moves (a source is never deleted before its copy is on disk)
+    None,
+    /// Flush everything once before deleting sources (default)
+    Batch,
+    /// Flush each file before installing it
+    Full,
 }
 
-fn parse_size(s: &str) -> Result<usize, String> {
-    let t = s.trim();
-    let (num, mult) = match t.chars().last() {
-        Some('K') | Some('k') => (&t[..t.len() - 1], 1024usize),
-        Some('M') | Some('m') => (&t[..t.len() - 1], 1024 * 1024),
-        Some('G') | Some('g') => (&t[..t.len() - 1], 1024 * 1024 * 1024),
-        Some(c) if c.is_ascii_digit() => (t, 1usize),
-        _ => return Err(format!("invalid size: {s}")),
-    };
-    let base: usize = num.trim().parse().map_err(|_| format!("invalid size: {s}"))?;
-    Ok(base.saturating_mul(mult).max(1))
+/// Move (rename) files and directories with progress bars — a safer `mv`.
+///
+/// On the same filesystem this is an atomic rename. Across filesystems the
+/// data is copied, flushed to disk and verified before the source is deleted;
+/// if anything goes wrong, the source is left untouched.
+#[derive(Parser)]
+#[command(name = "bmv", version, about, after_help = "Exit status: 0 success, 1 at least one error, 2 usage error, 130 interrupted.")]
+#[allow(clippy::struct_excessive_bools)]
+struct Args {
+    /// Replace existing destinations
+    #[arg(short = 'f', long, overrides_with_all = ["no_clobber", "interactive"])]
+    force: bool,
+    /// Never replace existing destinations (skip them silently)
+    #[arg(short = 'n', long, overrides_with_all = ["force", "interactive"])]
+    no_clobber: bool,
+    /// Ask before replacing an existing destination
+    #[arg(short = 'i', long, overrides_with_all = ["force", "no_clobber"])]
+    interactive: bool,
+    /// Move only when the source is newer than the destination
+    #[arg(short = 'u', long)]
+    update: bool,
+    /// Keep a backup of each replaced destination (NAME~)
+    #[arg(short = 'b', long)]
+    backup: bool,
+    /// Backup suffix (implies --backup)
+    #[arg(short = 'S', long, value_name = "SUFFIX")]
+    suffix: Option<String>,
+
+    /// Move all sources into DIRECTORY
+    #[arg(short = 't', long, value_name = "DIRECTORY", conflicts_with = "no_target_directory")]
+    target_directory: Option<PathBuf>,
+    /// Treat DEST as a normal file, never as a directory to move into
+    #[arg(short = 'T', long)]
+    no_target_directory: bool,
+
+    /// Worker threads for cross-filesystem copies (default: number of CPUs)
+    #[arg(short = 'j', long, value_name = "N")]
+    threads: Option<usize>,
+    /// Read/write buffer size, e.g. 256K, 1M (default: 1M)
+    #[arg(long, value_name = "SIZE", value_parser = cli::parse_size)]
+    buffer_size: Option<usize>,
+    /// Durability for cross-filesystem moves: batch (default) or full
+    #[arg(long, value_enum, value_name = "MODE")]
+    sync: Option<Sync>,
+
+    /// Stop at the first error instead of continuing
+    #[arg(long)]
+    strict: bool,
+    /// Show what would be done without changing anything
+    #[arg(long)]
+    dry_run: bool,
+    /// Explain what is being done
+    #[arg(short = 'v', long)]
+    verbose: bool,
+    /// Single-line progress
+    #[arg(short = 'q', long)]
+    quiet: bool,
+    /// No progress output at all
+    #[arg(long)]
+    no_progress: bool,
+
+    /// SOURCE... DEST, or SOURCE... with -t DIRECTORY
+    #[arg(required = true, value_name = "PATHS")]
+    paths: Vec<PathBuf>,
 }
 
 fn main() {
+    std::process::exit(real_main());
+}
+
+fn real_main() -> i32 {
     let args = Args::parse();
 
     let mut paths = args.paths;
-    let destination = PathBuf::from(paths.pop().expect("clap guarantees >= 2 paths"));
-    let sources: Vec<PathBuf> = paths.into_iter().map(PathBuf::from).collect();
-
-    let buffer_size = match args.buffer.as_deref().map(parse_size) {
-        Some(Ok(n)) => n,
-        Some(Err(e)) => {
-            eprintln!("bmv: {e}");
-            std::process::exit(2);
+    let dest = if let Some(dir) = args.target_directory {
+        if !dir.is_dir() {
+            eprintln!("bmv: target '{}' is not a directory", dir.display());
+            return 1;
         }
-        None => 1024 * 1024,
-    };
-
-    let progress = if args.no_progress {
-        ProgressMode::Silent
-    } else if args.quiet || !console::user_attended_stderr() {
-        // Explicit --quiet, or auto-degrade when stderr is not a TTY.
-        ProgressMode::Quiet
+        dir
     } else {
-        ProgressMode::Rich
+        if paths.len() < 2 {
+            Args::command().error(ErrorKind::MissingRequiredArgument, "missing destination operand").exit();
+        }
+        paths.pop().expect("len >= 2")
     };
 
     let config = Config {
-        source: sources.first().cloned().unwrap_or_default(),
-        destination: destination.clone(),
-        force: args.force,
-        no_clobber: args.no_clobber,
+        overwrite: if args.force {
+            Overwrite::Force
+        } else if args.no_clobber {
+            Overwrite::Skip
+        } else if args.interactive {
+            Overwrite::Prompt
+        } else {
+            Overwrite::Refuse
+        },
+        update: args.update,
+        backup_suffix: if args.backup || args.suffix.is_some() {
+            Some(args.suffix.unwrap_or_else(|| "~".into()))
+        } else {
+            None
+        },
+        no_target_directory: args.no_target_directory,
         verbose: args.verbose,
-        buffer_size,
-        // Moving a directory tree is implicitly recursive (rename or deep copy).
+        buffer_size: args.buffer_size.unwrap_or(1 << 20),
         recursive: true,
         threads: args.threads,
-        no_clone: false,
-        no_kernel_copy: false,
         dry_run: args.dry_run,
         strict: args.strict,
-        preserve: progress_copy::Preserve::all(),
-        progress,
+        sync: match args.sync {
+            Some(Sync::Full) => SyncMode::Full,
+            _ => SyncMode::Batch,
+        },
+        preserve: Preserve::all(),
+        progress: cli::progress_mode(args.quiet, args.no_progress),
+        ..Default::default()
     };
 
-    match run_move(&sources, &destination, &config) {
-        Ok(_) => std::process::exit(0),
+    match run_move(&paths, &dest, &config) {
+        Ok(report) => cli::finish("bmv", &report, config.verbose && !config.dry_run),
         Err(e) => {
             eprintln!("bmv: {e:#}");
-            std::process::exit(1);
+            1
         }
     }
 }

@@ -1,15 +1,20 @@
 [package]
 name = "bcp"
-version = "0.1.0"
-edition = "2024"
+description = "cp with progress bars, atomic writes and parallel copies"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+categories.workspace = true
+keywords.workspace = true
 
 [dependencies]
-progress_copy = { path = "../progress_copy" }
-clap = { version = "4.6.1", features = ["derive"] }
-anyhow = "1.0.102"
-console = "0.16.3"
+progress_copy.workspace = true
+clap.workspace = true
 
 [dev-dependencies]
-assert_cmd = "2.2.2"
-predicates = "3.1.4"
-tempfile = "3.27.0"
+assert_cmd.workspace = true
+predicates.workspace = true
+tempfile.workspace = true
+libc.workspace = true
+filetime.workspace = true

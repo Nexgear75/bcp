@@ -1,251 +1,458 @@
-//! Phase 3 of the pipeline: execute a [`CopyPlan`] in parallel, dispatching
-//! each file to the fastest available strategy and updating shared counters.
+//! Phase 3 of the pipeline: execute a [`CopyPlan`].
+//!
+//! Every entry is first materialised under a temp name next to its
+//! destination, then installed with an atomic rename (never replacing an
+//! existing entry unless the plan allows it). Regular files run in parallel
+//! on a rayon pool, largest first.
 
-use std::path::Path;
+use std::collections::{BTreeSet, HashSet};
+use std::fs::File;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
 use rayon::prelude::*;
-use tempfile::Builder;
 
-use crate::config::Config;
-#[allow(unused_imports)]
+use crate::atomic::{TempFile, TempPath};
+use crate::config::{Config, SyncMode};
 use crate::error::CopyError;
+use crate::metadata::{self, Target};
 use crate::signals::CancelState;
-use crate::types::{CopyCounters, CopyPlan, CopyReport, FileEntry, FileKind};
+use crate::types::{CopyCounters, CopyPlan, CopyReport, FileEntry, FileJob, FileKind};
 
-/// Execute a plan, returning a [`CopyReport`].
-///
-/// `counters` is shared with the progress display thread; `cancel` is the
-/// SIGINT state polled between files and chunks.
-pub fn execute_plan(
-    plan: &CopyPlan,
-    config: &Config,
-    counters: &CopyCounters,
-    cancel: &Arc<CancelState>,
-) -> anyhow::Result<CopyReport> {
-    let mut report = CopyReport::default();
-    let errors: Mutex<Vec<String>> = Mutex::new(Vec::new());
+/// Result of [`execute_plan`].
+#[derive(Debug, Default)]
+pub struct ExecOutcome {
+    pub report: CopyReport,
+    /// Source paths whose entry was fully transferred (used by `bmv` to know
+    /// exactly what it may delete).
+    pub transferred: HashSet<PathBuf>,
+}
 
-    // 1. Create destination directories first (sequential, ordered).
-    // `dirs_to_create` is in walk order (parents before children), so a plain
-    // `create_dir` succeeds in the common case; only fall back to the costlier
-    // `create_dir_all` (which re-stats every ancestor) when a parent is missing.
-    for dir in &plan.dirs_to_create {
-        let created = match std::fs::create_dir(dir) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => std::fs::create_dir_all(dir),
-            Err(e) => Err(e),
-        };
-        if let Err(e) = created {
-            if config.strict {
-                return Err(anyhow::anyhow!("create dir {}: {e}", dir.display()));
-            }
-            errors.lock().unwrap().push(format!("create dir {}: {e}", dir.display()));
+/// Shared mutable state of one execution.
+struct Shared<'a> {
+    config: &'a Config,
+    counters: &'a CopyCounters,
+    cancel: &'a CancelState,
+    clone_disabled: AtomicBool,
+    errors: Mutex<Vec<String>>,
+    warnings: Mutex<Vec<String>>,
+    transferred: Mutex<HashSet<PathBuf>>,
+    /// Regular files installed (for batch sync).
+    written: Mutex<Vec<PathBuf>>,
+    /// Every installed destination path (for directory fsync).
+    installed: Mutex<Vec<PathBuf>>,
+    fatal: Mutex<Option<String>>,
+}
+
+impl Shared<'_> {
+    fn stopped(&self) -> bool {
+        self.cancel.is_cancelled()
+    }
+
+    fn success(&self, entry: &FileEntry, dest: &Path, regular: bool) {
+        self.transferred.lock().expect("lock").insert(entry.source_path.clone());
+        self.installed.lock().expect("lock").push(dest.to_path_buf());
+        if regular {
+            self.written.lock().expect("lock").push(dest.to_path_buf());
+        }
+    }
+
+    fn metadata_problems(&self, dest: &Path, problems: Vec<String>) {
+        if problems.is_empty() {
+            return;
+        }
+        let msg = format!("{}: cannot preserve {}", dest.display(), problems.join("; "));
+        if self.config.strict {
+            self.fail(msg);
         } else {
-            report.dirs_created += 1;
-            counters.dirs_done.fetch_add(1, Ordering::Relaxed);
+            self.warnings.lock().expect("lock").push(msg);
         }
     }
 
-    // 2. Recreate symlinks.
-    for (entry, dest) in &plan.symlinks {
-        if let FileKind::Symlink { target } = &entry.kind {
-            let _ = std::fs::remove_file(dest); // overwrite if present
-            if let Err(e) = std::os::unix::fs::symlink(target, dest) {
-                if config.strict {
-                    return Err(anyhow::anyhow!("symlink {}: {e}", dest.display()));
-                }
-                errors.lock().unwrap().push(format!("symlink {}: {e}", dest.display()));
-            } else {
-                report.symlinks_created += 1;
+    fn fail(&self, msg: String) {
+        if self.config.strict {
+            let mut f = self.fatal.lock().expect("lock");
+            if f.is_none() {
+                *f = Some(msg.clone());
             }
+            self.cancel.abort();
         }
+        self.errors.lock().expect("lock").push(msg);
+    }
+}
+
+/// Execute a plan.
+///
+/// `counters` is shared with the progress display; `cancel` is polled
+/// between files and chunks.
+///
+/// # Errors
+/// Only in `--strict` mode (first failure) or when the thread pool can't be
+/// built. Otherwise failures are collected in the report.
+pub fn execute_plan(plan: &CopyPlan, config: &Config, counters: &CopyCounters, cancel: &CancelState) -> anyhow::Result<ExecOutcome> {
+    let sh = Shared {
+        config,
+        counters,
+        cancel,
+        clone_disabled: AtomicBool::new(false),
+        errors: Mutex::new(Vec::new()),
+        warnings: Mutex::new(Vec::new()),
+        transferred: Mutex::new(HashSet::new()),
+        written: Mutex::new(Vec::new()),
+        installed: Mutex::new(Vec::new()),
+        fatal: Mutex::new(None),
+    };
+
+    // Unsupported / unreadable entries are failures, not silent skips.
+    for w in &plan.scan_warnings {
+        counters.files_failed.fetch_add(1, Ordering::Relaxed);
+        sh.fail(w.to_string());
     }
 
-    // 3. Clones (macOS APFS) — near-instant, run sequentially.
-    #[cfg(target_os = "macos")]
-    for (entry, dest) in &plan.files_to_clone {
-        if cancel.cancelled.load(Ordering::Relaxed) {
+    // 1. Directories (parents first). Created writable; final mode later.
+    for job in &plan.dirs {
+        if sh.stopped() {
             break;
         }
-        match clone_file_atomic(entry, dest, config) {
+        match create_dir(&job.dest, job.replace) {
             Ok(()) => {
-                counters.files_done.fetch_add(1, Ordering::Relaxed);
-                counters.bytes_copied.fetch_add(entry.size, Ordering::Relaxed);
+                counters.dirs_done.fetch_add(1, Ordering::Relaxed);
+                sh.success(&job.entry, &job.dest, false);
             }
-            Err(e) => {
-                // Fall back to a regular copy on clone failure.
-                match copy_file_atomic(entry, dest, config, &counters.bytes_copied, &cancel.cancelled) {
-                    Ok(()) => {
-                        counters.files_done.fetch_add(1, Ordering::Relaxed);
-                    }
-                    Err(e2) => {
-                        counters.files_failed.fetch_add(1, Ordering::Relaxed);
-                        handle_file_error(&errors, config, cancel, dest, &format!("{e} / fallback: {e2}"))?;
-                    }
-                }
-            }
+            Err(e) => sh.fail(format!("cannot create directory '{}': {e}", job.dest.display())),
         }
     }
-    #[cfg(not(target_os = "macos"))]
-    debug_assert!(plan.files_to_clone.is_empty());
+    let dirs_created = plan.dirs.iter().filter(|j| !j.replace).count() as u64;
 
-    // 4. Parallel copies.
+    // 2. Regular files, in parallel.
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(config.thread_count())
         .build()
-        .context("Failed to build thread pool")?;
-
+        .context("failed to build thread pool")?;
     pool.install(|| {
-        plan.files_to_copy.par_iter().for_each(|(entry, dest)| {
-            if cancel.cancelled.load(Ordering::Relaxed) {
+        plan.files.par_iter().with_max_len(1).for_each(|job| {
+            if sh.stopped() {
                 return;
             }
-            match copy_file_atomic(entry, dest, config, &counters.bytes_copied, &cancel.cancelled) {
-                Ok(()) => {
-                    counters.files_done.fetch_add(1, Ordering::Relaxed);
-                }
-                Err(e) => {
-                    counters.files_failed.fetch_add(1, Ordering::Relaxed);
-                    let _ = handle_file_error(&errors, config, cancel, dest, &e.to_string());
-                }
-            }
+            run_file_job(&sh, job);
         });
     });
 
-    report.cancelled = cancel.cancelled.load(Ordering::Relaxed);
-    report.files_copied = counters.files_done.load(Ordering::Relaxed);
-    report.files_failed = counters.files_failed.load(Ordering::Relaxed);
-    report.bytes_copied = counters.bytes_copied.load(Ordering::Relaxed);
-    report.errors = errors.into_inner().unwrap();
-
-    Ok(report)
-}
-
-/// Record a per-file error; in strict mode signal cancellation so other
-/// workers stop, and propagate the error.
-fn handle_file_error(
-    errors: &Mutex<Vec<String>>,
-    config: &Config,
-    cancel: &Arc<CancelState>,
-    dest: &Path,
-    msg: &str,
-) -> anyhow::Result<()> {
-    let full = format!("{}: {msg}", dest.display());
-    errors.lock().unwrap().push(full.clone());
-    if config.strict {
-        cancel.cancelled.store(true, Ordering::Relaxed);
-        return Err(anyhow::anyhow!(full));
-    }
-    Ok(())
-}
-
-/// Copy a single regular file atomically: temp → strategy copy → fsync →
-/// metadata → rename.
-pub fn copy_file_atomic(
-    entry: &FileEntry,
-    dest: &Path,
-    config: &Config,
-    bytes_copied: &Arc<AtomicU64>,
-    cancelled: &AtomicBool,
-) -> anyhow::Result<()> {
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create parent dir for {}", dest.display()))?;
-    }
-
-    let dest_dir = dest.parent().unwrap_or(Path::new("."));
-    let prefix = format!(
-        ".{}.",
-        dest.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()
-    );
-    let tmp = Builder::new()
-        .prefix(&prefix)
-        .tempfile_in(dest_dir)
-        .context("Failed to create temporary file")?;
-
-    let tmp_path = tmp.path().to_path_buf();
-    let mut tmp_file = fs_err::OpenOptions::new()
-        .write(true)
-        .open(&tmp_path)
-        .context("Failed to open temp file for writing")?;
-
-    let mut src_file = fs_err::File::open(&entry.source_path)
-        .with_context(|| format!("open source {}", entry.source_path.display()))?;
-
-    copy_data(&mut src_file, &mut tmp_file, entry.size, config, bytes_copied, cancelled)?;
-
-    drop(tmp_file);
-    crate::atomic::sync_file(tmp.as_file()).context("fsync temp file")?;
-
-    // Apply metadata onto the temp file before the rename (atomic visibility).
-    if config.preserve.any()
-        && let Err(e) = crate::metadata::apply(&entry.source_path, &tmp_path, config.preserve)
-            && config.strict {
-                anyhow::bail!("metadata: {e}");
+    // 3. Symlinks, FIFOs, hardlinks (hardlinks need their target copied).
+    let mut symlinks = 0;
+    let mut fifos = 0;
+    let mut hardlinks = 0;
+    for job in &plan.symlinks {
+        if sh.stopped() {
+            break;
+        }
+        match make_special(&job.entry, &job.dest, job.replace, config) {
+            Ok(problems) => {
+                symlinks += 1;
+                sh.success(&job.entry, &job.dest, false);
+                sh.metadata_problems(&job.dest, problems);
             }
-
-    tmp.persist(dest).map_err(|e| anyhow::anyhow!("rename into place: {}", e))?;
-    Ok(())
-}
-
-/// Copy file bytes using the best available strategy.
-#[allow(unused_variables)]
-fn copy_data(
-    src: &mut fs_err::File,
-    dst: &mut fs_err::File,
-    size: u64,
-    config: &Config,
-    bytes_copied: &Arc<AtomicU64>,
-    cancelled: &AtomicBool,
-) -> anyhow::Result<u64> {
-    #[cfg(target_os = "linux")]
-    if !config.no_kernel_copy {
-        match crate::platform::linux::copy_file_range(&*src, &*dst, size, bytes_copied, cancelled) {
-            Ok(Some(total)) => return Ok(total),
-            Ok(None) => { /* unsupported → fall back to chunked */ }
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
-                return Err(CopyError::Cancelled.into());
+            Err(e) => sh.fail(format!("cannot create symlink '{}': {e:#}", job.dest.display())),
+        }
+    }
+    for job in &plan.fifos {
+        if sh.stopped() {
+            break;
+        }
+        match make_special(&job.entry, &job.dest, job.replace, config) {
+            Ok(problems) => {
+                fifos += 1;
+                sh.success(&job.entry, &job.dest, false);
+                sh.metadata_problems(&job.dest, problems);
             }
-            Err(e) => return Err(e.into()),
+            Err(e) => sh.fail(format!("cannot create fifo '{}': {e:#}", job.dest.display())),
+        }
+    }
+    let link_targets: HashSet<PathBuf> = if plan.hardlinks.is_empty() {
+        HashSet::new()
+    } else {
+        sh.installed.lock().expect("lock").iter().cloned().collect()
+    };
+    for job in &plan.hardlinks {
+        if sh.stopped() {
+            break;
+        }
+        let target_ok = link_targets.contains(&job.target);
+        let linked = target_ok && link_into_place(&job.target, &job.dest, job.replace, config).is_ok();
+        if linked {
+            hardlinks += 1;
+            sh.success(&job.entry, &job.dest, false);
+        } else {
+            // Target missing or filesystem without hardlinks: plain copy.
+            let fj = FileJob { entry: job.entry.clone(), dest: job.dest.clone(), clone: false, replace: job.replace };
+            run_file_job(&sh, &fj);
         }
     }
 
-    let total = crate::copy::chunked_copy_with_progress(
-        src, dst, size, config.buffer_size, bytes_copied, cancelled,
-    )
-    .map_err(anyhow::Error::new)?;
-    Ok(total)
+    // 4. Directory metadata, deepest first (creating files inside a directory
+    //    changes its mtime, and a read-only mode would block those writes).
+    if !sh.stopped() {
+        for job in plan.dirs.iter().rev() {
+            if !job.replace || config.preserve.any() {
+                let problems = metadata::apply(&job.entry.source_path, &job.entry.meta, Target::Path(&job.dest), config.preserve);
+                sh.metadata_problems(&job.dest, problems);
+            }
+        }
+    }
+
+    // 5. Durability.
+    let written = std::mem::take(&mut *sh.written.lock().expect("lock"));
+    let installed = std::mem::take(&mut *sh.installed.lock().expect("lock"));
+    if let Err(e) = flush(config.sync, &written, &installed) {
+        sh.fail(format!("cannot flush data to disk: {e}"));
+    }
+
+    if let Some(msg) = sh.fatal.lock().expect("lock").take() {
+        anyhow::bail!(msg);
+    }
+
+    let report = CopyReport {
+        files_copied: counters.files_done.load(Ordering::Relaxed),
+        files_failed: counters.files_failed.load(Ordering::Relaxed),
+        files_skipped: plan.skipped.len() as u64,
+        bytes_copied: counters.bytes_copied.load(Ordering::Relaxed),
+        dirs_created,
+        symlinks_created: symlinks,
+        hardlinks_created: hardlinks,
+        fifos_created: fifos,
+        renamed: 0,
+        cancelled: cancel.is_interrupted(),
+        errors: sh.errors.into_inner().expect("lock"),
+        warnings: sh.warnings.into_inner().expect("lock"),
+    };
+    Ok(ExecOutcome { report, transferred: sh.transferred.into_inner().expect("lock") })
 }
 
-/// Clone a single file atomically (macOS): clonefile → temp → rename.
+fn run_file_job(sh: &Shared<'_>, job: &FileJob) {
+    let r = transfer_file(job, sh.config, &sh.counters.bytes_copied, &sh.cancel.cancelled, &sh.clone_disabled);
+    match r {
+        Ok((problems, cloned)) => {
+            sh.counters.files_done.fetch_add(1, Ordering::Relaxed);
+            // A clone wrote no data: nothing to flush but its directory entry.
+            sh.success(&job.entry, &job.dest, !cloned);
+            sh.metadata_problems(&job.dest, problems);
+        }
+        Err(e) if is_cancel(&e) && sh.stopped() => {}
+        Err(e) => {
+            sh.counters.files_failed.fetch_add(1, Ordering::Relaxed);
+            sh.fail(format!("cannot copy '{}' to '{}': {e:#}", job.entry.source_path.display(), job.dest.display()));
+        }
+    }
+}
+
+fn is_cancel(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        matches!(c.downcast_ref::<CopyError>(), Some(CopyError::Cancelled))
+            || c.downcast_ref::<std::io::Error>().is_some_and(|io| io.kind() == std::io::ErrorKind::Interrupted)
+    })
+}
+
+fn create_dir(dest: &Path, exists: bool) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    if exists {
+        return Ok(());
+    }
+    // Owner-writable while we fill it; the final mode is applied at the end.
+    let mut b = std::fs::DirBuilder::new();
+    b.mode(0o700 | (0o777 & !crate::atomic::process_umask()));
+    match b.create(dest) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && dest.is_dir() => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            b.recursive(true);
+            b.create(dest)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Transfer one regular file (clone if possible, else copy). Returns the
+/// metadata problems (non-fatal) and whether it was cloned.
+fn transfer_file(
+    job: &FileJob,
+    config: &Config,
+    bytes: &Arc<AtomicU64>,
+    cancelled: &AtomicBool,
+    clone_disabled: &AtomicBool,
+) -> anyhow::Result<(Vec<String>, bool)> {
+    #[cfg(target_os = "macos")]
+    if job.clone && !clone_disabled.load(Ordering::Relaxed) {
+        match clone_into_place(job, config) {
+            Ok(problems) => {
+                bytes.fetch_add(job.entry.size(), Ordering::Relaxed);
+                return Ok((problems, true));
+            }
+            Err(e) => {
+                if let Some(io) = e.downcast_ref::<std::io::Error>()
+                    && crate::platform::macos::clone_permanently_unsupported(io)
+                {
+                    clone_disabled.store(true, Ordering::Relaxed);
+                }
+                if e.downcast_ref::<CopyError>().is_some() {
+                    return Err(e); // DestinationExists race: don't retry
+                }
+            }
+        }
+    }
+    let _ = clone_disabled;
+    copy_regular(&job.entry, &job.dest, job.replace, config, bytes, cancelled).map(|(_, p)| (p, false))
+}
+
+/// Copy a regular file through a temp file. Returns (bytes, metadata problems).
+fn copy_regular(
+    entry: &FileEntry,
+    dest: &Path,
+    replace: bool,
+    config: &Config,
+    bytes: &Arc<AtomicU64>,
+    cancelled: &AtomicBool,
+) -> anyhow::Result<(u64, Vec<String>)> {
+    let mut src = File::open(&entry.source_path).with_context(|| format!("open '{}'", entry.source_path.display()))?;
+    let mut tmp = TempFile::create_for(dest).with_context(|| format!("create temp file next to '{}'", dest.display()))?;
+
+    let total = copy_data(&mut src, &mut tmp.file, entry, config, bytes, cancelled)?;
+
+    let problems = metadata::apply(&entry.source_path, &entry.meta, Target::File(&tmp.file), config.preserve);
+    if config.sync == SyncMode::Full {
+        crate::atomic::sync_file(&tmp.file).context("fsync")?;
+    }
+    install(tmp, dest, replace, config)?;
+    Ok((total, problems))
+}
+
+fn install(tmp: TempFile, dest: &Path, replace: bool, config: &Config) -> anyhow::Result<()> {
+    tmp.install(dest, replace, config.backup_suffix.as_deref()).map_err(|e| map_install_err(e, dest))
+}
+
+fn map_install_err(e: std::io::Error, dest: &Path) -> anyhow::Error {
+    if e.kind() == std::io::ErrorKind::AlreadyExists {
+        // Appeared after planning: never overwrite it.
+        CopyError::DestinationExists(dest.to_path_buf()).into()
+    } else {
+        anyhow::Error::new(e).context("rename into place")
+    }
+}
+
+fn copy_data(
+    src: &mut File,
+    dst: &mut File,
+    entry: &FileEntry,
+    config: &Config,
+    bytes: &Arc<AtomicU64>,
+    cancelled: &AtomicBool,
+) -> anyhow::Result<u64> {
+    let size = entry.size();
+    if entry.is_sparse()
+        && let Some(n) = crate::copy::sparse_copy(src, dst, size, config.buffer_size, bytes, cancelled)?
+    {
+        return Ok(n);
+    }
+
+    #[allow(unused_mut)]
+    let mut done: u64 = 0;
+    #[cfg(target_os = "linux")]
+    {
+        use crate::platform::linux::{KernelCopy, advise_sequential, copy_file_range};
+        if !config.no_kernel_copy {
+            match copy_file_range(src, dst, size, bytes, cancelled) {
+                Ok(KernelCopy::Done(n)) => return Ok(n),
+                Ok(KernelCopy::Partial(n)) => done = n,
+                Ok(KernelCopy::Unsupported) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => return Err(CopyError::Cancelled.into()),
+                Err(e) => return Err(anyhow::Error::new(e).context("copy_file_range")),
+            }
+        }
+        advise_sequential(src);
+    }
+    let rest = crate::copy::chunked_copy_with_progress(src, dst, size.saturating_sub(done), config.buffer_size, bytes, cancelled)?;
+    Ok(done + rest)
+}
+
+/// macOS: clone to a temp name, fix metadata, rename into place.
 #[cfg(target_os = "macos")]
-fn clone_file_atomic(entry: &FileEntry, dest: &Path, _config: &Config) -> anyhow::Result<()> {
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create parent dir for {}", dest.display()))?;
+fn clone_into_place(job: &FileJob, config: &Config) -> anyhow::Result<Vec<String>> {
+    let tmp = TempPath::reserve(&job.dest);
+    let follow = config.dereference != crate::config::Dereference::Never;
+    crate::platform::macos::clonefile(&job.entry.source_path, tmp.path(), follow)?;
+    let f = File::open(tmp.path())?;
+    let problems = metadata::apply(&job.entry.source_path, &job.entry.meta, Target::File(&f), config.preserve);
+    if config.sync == SyncMode::Full {
+        crate::atomic::sync_file(&f)?;
     }
-    let dest_dir = dest.parent().unwrap_or(Path::new("."));
-    // clonefile requires the target not to exist; use a unique temp name.
-    let tmp_name = format!(
-        ".{}.clone.{}",
-        dest.file_name().map(|n| n.to_string_lossy()).unwrap_or_default(),
-        std::process::id()
-    );
-    let tmp_path = dest_dir.join(tmp_name);
-    let _ = std::fs::remove_file(&tmp_path);
+    drop(f);
+    tmp.install(&job.dest, job.replace, config.backup_suffix.as_deref())
+        .map_err(|e| map_install_err(e, &job.dest))?;
+    Ok(problems)
+}
 
-    crate::platform::macos::clonefile(&entry.source_path, &tmp_path)
-        .with_context(|| format!("clonefile {}", entry.source_path.display()))?;
+/// Recreate a symlink or FIFO under a temp name, then install it.
+fn make_special(entry: &FileEntry, dest: &Path, replace: bool, config: &Config) -> anyhow::Result<Vec<String>> {
+    let tmp = TempPath::reserve(dest);
+    let problems = match &entry.kind {
+        FileKind::Symlink { target } => {
+            std::os::unix::fs::symlink(target, tmp.path())?;
+            metadata::apply(&entry.source_path, &entry.meta, Target::Symlink(tmp.path()), config.preserve)
+        }
+        FileKind::Fifo => {
+            nix::unistd::mkfifo(tmp.path(), nix::sys::stat::Mode::from_bits_truncate(0o600))?;
+            metadata::apply(&entry.source_path, &entry.meta, Target::Fifo(tmp.path()), config.preserve)
+        }
+        _ => anyhow::bail!("not a special file"),
+    };
+    tmp.install(dest, replace, config.backup_suffix.as_deref()).map_err(|e| map_install_err(e, dest))?;
+    Ok(problems)
+}
 
-    // Apply metadata + atomic rename into place.
-    if _config.preserve.any() {
-        let _ = crate::metadata::apply(&entry.source_path, &tmp_path, _config.preserve);
+fn link_into_place(target: &Path, dest: &Path, replace: bool, config: &Config) -> anyhow::Result<()> {
+    let tmp = TempPath::reserve(dest);
+    std::fs::hard_link(target, tmp.path())?;
+    tmp.install(dest, replace, config.backup_suffix.as_deref()).map_err(|e| map_install_err(e, dest))
+}
+
+/// Make the run durable according to `mode`.
+fn flush(mode: SyncMode, written: &[PathBuf], installed: &[PathBuf]) -> std::io::Result<()> {
+    if mode == SyncMode::None || installed.is_empty() {
+        return Ok(());
     }
-    std::fs::rename(&tmp_path, dest)
-        .with_context(|| format!("rename clone into {}", dest.display()))?;
-    Ok(())
+    if mode == SyncMode::Batch
+        && let Some(first) = installed.first()
+    {
+        let dir = first.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        crate::atomic::sync_filesystem(dir, written)?;
+    }
+    // Make the new names durable: fsync every directory we added entries to.
+    let dirs: BTreeSet<PathBuf> = installed
+        .iter()
+        .filter_map(|p| p.parent())
+        .map(|p| if p.as_os_str().is_empty() { PathBuf::from(".") } else { p.to_path_buf() })
+        .collect();
+    dirs.par_iter().try_for_each(|d| crate::atomic::fsync_dir(d))
+}
+
+/// Copy one regular file atomically with full durability; refuses to replace
+/// an existing destination. Used by [`crate::atomic::atomic_copy`].
+///
+/// # Errors
+/// Open/read/write errors, `Cancelled`, or `DestinationExists`.
+pub fn copy_single_file(
+    src: &Path,
+    dest: &Path,
+    config: &Config,
+    bytes: &Arc<AtomicU64>,
+    cancelled: &AtomicBool,
+) -> anyhow::Result<u64> {
+    let meta = std::fs::metadata(src).map_err(|_| CopyError::SourceNotFound(src.to_path_buf()))?;
+    let entry = FileEntry { source_path: src.to_path_buf(), relative_path: PathBuf::new(), meta, kind: FileKind::File };
+    let (n, _) = copy_regular(&entry, dest, false, config, bytes, cancelled)?;
+    if let Some(parent) = dest.parent().filter(|p| !p.as_os_str().is_empty()) {
+        crate::atomic::fsync_dir(parent)?;
+    }
+    Ok(n)
 }

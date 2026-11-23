@@ -136,27 +136,42 @@ fn test_force_flag_overwrites() {
     assert_eq!(dest_content, src_content, "Force must overwrite dest with source content");
 }
 
-// ── No-clobber refuses existing dest ───────────────────────────────
+// ── No-clobber skips existing dest (like cp -n) ────────────────────
 
 #[test]
-fn test_no_clobber_refuses() {
+fn test_no_clobber_skips() {
     let mut src = NamedTempFile::new().unwrap();
     src.write_all(b"new content").unwrap();
     src.flush().unwrap();
 
     let dst_dir = tempfile::TempDir::new().unwrap();
     let dst_path = dst_dir.path().join("no_clobber_dest.bin");
-
-    // Pre-create destination
     std::fs::write(&dst_path, b"existing content").unwrap();
-    let dst_str = dst_path.to_string_lossy().to_string();
 
-    let mut cmd = Command::cargo_bin("bcp").unwrap();
-    cmd.arg("-n")
-        .arg(src.path().to_string_lossy().as_ref())
-        .arg(&dst_str);
+    Command::cargo_bin("bcp").unwrap()
+        .arg("-n")
+        .arg(src.path())
+        .arg(&dst_path)
+        .assert()
+        .success();
+    assert_eq!(std::fs::read(&dst_path).unwrap(), b"existing content");
+}
 
-    cmd.assert().failure();
+#[test]
+fn test_existing_dest_refused_by_default() {
+    let mut src = NamedTempFile::new().unwrap();
+    src.write_all(b"new").unwrap();
+    let dst_dir = tempfile::TempDir::new().unwrap();
+    let dst_path = dst_dir.path().join("d");
+    std::fs::write(&dst_path, b"old").unwrap();
+
+    Command::cargo_bin("bcp").unwrap()
+        .arg(src.path())
+        .arg(&dst_path)
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("-f to overwrite"));
+    assert_eq!(std::fs::read(&dst_path).unwrap(), b"old");
 }
 
 // ── Nonexistent source ─────────────────────────────────────────────
@@ -168,23 +183,20 @@ fn test_nonexistent_source() {
     cmd.assert().failure();
 }
 
-// ── Conflicting flags (-f + -n) ────────────────────────────────────
+// ── -f / -n / -i: the last one wins (like GNU cp) ──────────────────
 
 #[test]
-fn test_conflicting_flags() {
+fn test_last_overwrite_flag_wins() {
     let mut src = NamedTempFile::new().unwrap();
-    src.write_all(b"some data").unwrap();
-    src.flush().unwrap();
-
+    src.write_all(b"new").unwrap();
     let dst_dir = tempfile::TempDir::new().unwrap();
-    let dst_path = dst_dir.path().join("conflict_dest.bin");
-    let dst_str = dst_path.to_string_lossy().to_string();
+    let dst_path = dst_dir.path().join("d");
+    std::fs::write(&dst_path, b"old").unwrap();
 
-    let mut cmd = Command::cargo_bin("bcp").unwrap();
-    cmd.arg("-f")
-        .arg("-n")
-        .arg(src.path().to_string_lossy().as_ref())
-        .arg(&dst_str);
-
-    cmd.assert().failure();
+    // -f then -n → -n: skip.
+    Command::cargo_bin("bcp").unwrap().args(["-f", "-n"]).arg(src.path()).arg(&dst_path).assert().success();
+    assert_eq!(std::fs::read(&dst_path).unwrap(), b"old");
+    // -n then -f → -f: replace.
+    Command::cargo_bin("bcp").unwrap().args(["-n", "-f"]).arg(src.path()).arg(&dst_path).assert().success();
+    assert_eq!(std::fs::read(&dst_path).unwrap(), b"new");
 }

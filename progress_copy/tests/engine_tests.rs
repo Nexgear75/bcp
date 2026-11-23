@@ -185,7 +185,9 @@ fn test_move_self_refused() {
     let f = dir.path().join("s.txt");
     write(&f, b"x");
     let cfg = Config { progress: ProgressMode::Silent, ..Default::default() };
-    assert!(run_move(std::slice::from_ref(&f), &f, &cfg).is_err());
+    let r = run_move(std::slice::from_ref(&f), &f, &cfg).unwrap();
+    assert_eq!(r.exit_code(), 1, "moving a file onto itself must fail");
+    assert!(f.exists());
 }
 
 // Small helper trait to read the inode portably within the test.
