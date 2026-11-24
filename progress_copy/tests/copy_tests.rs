@@ -4,8 +4,8 @@
 //! before/after first chunk, and empty files.
 
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use progress_copy::copy::chunked_copy_with_progress;
 use progress_copy::error::CopyError;
@@ -29,11 +29,7 @@ fn create_source_file(data: &[u8]) -> (NamedTempFile, fs_err::File) {
 fn create_dest_file() -> (NamedTempFile, fs_err::File) {
     let tmp = NamedTempFile::new().unwrap();
     let path = tmp.path().to_path_buf();
-    let f = fs_err::OpenOptions::new()
-        .write(true)
-        .truncate(true)
-        .open(&path)
-        .unwrap();
+    let f = fs_err::OpenOptions::new().write(true).truncate(true).open(&path).unwrap();
     (tmp, f)
 }
 
@@ -47,14 +43,7 @@ fn test_chunked_copy_full_file() {
     let bytes_copied = Arc::new(AtomicU64::new(0));
     let cancelled = AtomicBool::new(false);
 
-    let result = chunked_copy_with_progress(
-        &mut src,
-        &mut dst,
-        data.len() as u64,
-        4096,
-        &bytes_copied,
-        &cancelled,
-    );
+    let result = chunked_copy_with_progress(&mut src, &mut dst, data.len() as u64, 4096, &bytes_copied, &cancelled);
 
     assert!(result.is_ok(), "Expected Ok, got {:?}", result.err());
     let total = result.unwrap();
@@ -73,14 +62,7 @@ fn test_chunked_copy_larger_than_buffer() {
     let cancelled = AtomicBool::new(false);
 
     // buffer_size = 4096 → 4 chunks (16 KB / 4 KB)
-    let result = chunked_copy_with_progress(
-        &mut src,
-        &mut dst,
-        data.len() as u64,
-        4096,
-        &bytes_copied,
-        &cancelled,
-    );
+    let result = chunked_copy_with_progress(&mut src, &mut dst, data.len() as u64, 4096, &bytes_copied, &cancelled);
 
     assert!(result.is_ok(), "Multi-chunk copy should succeed");
     assert_eq!(result.unwrap(), 16384);
@@ -98,14 +80,7 @@ fn test_chunked_copy_cancel_before_start() {
     let bytes_copied = Arc::new(AtomicU64::new(0));
     let cancelled = AtomicBool::new(true); // already cancelled
 
-    let result = chunked_copy_with_progress(
-        &mut src,
-        &mut dst,
-        data.len() as u64,
-        4096,
-        &bytes_copied,
-        &cancelled,
-    );
+    let result = chunked_copy_with_progress(&mut src, &mut dst, data.len() as u64, 4096, &bytes_copied, &cancelled);
 
     assert!(result.is_err(), "Expected Err(Cancelled)");
     match result.unwrap_err() {

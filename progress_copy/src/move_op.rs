@@ -48,7 +48,9 @@ pub fn run_move(sources: &[PathBuf], dest: &Path, config: &Config) -> anyhow::Re
         let dest_path = if dest_dir { dest.join(name) } else { dest.to_path_buf() };
         match move_one(source, &dest_path, config, &cancel) {
             Ok(r) => report.absorb(r),
-            Err(e) => report.errors.push(format!("cannot move '{}' to '{}': {e:#}", source.display(), dest_path.display())),
+            Err(e) => {
+                report.errors.push(format!("cannot move '{}' to '{}': {e:#}", source.display(), dest_path.display()))
+            }
         }
     }
     report.cancelled |= cancel.is_interrupted();
@@ -67,8 +69,8 @@ fn move_one(source: &Path, dest_path: &Path, config: &Config, cancel: &CancelSta
     let entry = FileEntry { source_path: source.to_path_buf(), relative_path: PathBuf::new(), meta, kind };
 
     // lstat comparison: never opens anything (opening a FIFO would block).
-    let same = std::fs::symlink_metadata(dest_path)
-        .is_ok_and(|d| d.dev() == entry.device_id() && d.ino() == entry.inode());
+    let same =
+        std::fs::symlink_metadata(dest_path).is_ok_and(|d| d.dev() == entry.device_id() && d.ino() == entry.inode());
     if same {
         anyhow::bail!("'{}' and '{}' are the same file", source.display(), dest_path.display());
     }
@@ -119,12 +121,18 @@ fn move_one(source: &Path, dest_path: &Path, config: &Config, cancel: &CancelSta
 }
 
 fn print_dry_run(source: &Path, dest_path: &Path, entry: &FileEntry) {
-    let dest_dev = std::fs::metadata(plan::nearest_existing(dest_path.parent().unwrap_or(Path::new(".")))).map(|m| m.dev());
+    let dest_dev =
+        std::fs::metadata(plan::nearest_existing(dest_path.parent().unwrap_or(Path::new(".")))).map(|m| m.dev());
     let how = if dest_dev.ok() == Some(entry.device_id()) { "rename" } else { "copy + delete (different filesystem)" };
     eprintln!("would move '{}' -> '{}' [{how}]", source.display(), dest_path.display());
 }
 
-fn cross_device_move(source: &Path, dest_path: &Path, config: &Config, cancel: &CancelState) -> anyhow::Result<CopyReport> {
+fn cross_device_move(
+    source: &Path,
+    dest_path: &Path,
+    config: &Config,
+    cancel: &CancelState,
+) -> anyhow::Result<CopyReport> {
     let mut cfg = config.clone();
     cfg.recursive = true;
     if cfg.sync == SyncMode::None {
@@ -142,7 +150,8 @@ fn cross_device_move(source: &Path, dest_path: &Path, config: &Config, cancel: &
     let plan = plan?;
 
     let counters = CopyCounters::new();
-    let display = progress::create_multi_progress(plan.total_bytes, plan.total_files, plan.dirs.len() as u64, cfg.progress);
+    let display =
+        progress::create_multi_progress(plan.total_bytes, plan.total_files, plan.dirs.len() as u64, cfg.progress);
     let ticker = display.spawn_ticker(counters.clone());
     let result = engine::execute_plan(&plan, &cfg, &counters, cancel);
     display.finish();
@@ -154,10 +163,7 @@ fn cross_device_move(source: &Path, dest_path: &Path, config: &Config, cancel: &
         return Ok(report);
     }
     if !report.is_success() || !plan.skipped.is_empty() {
-        report.errors.push(format!(
-            "some entries were not transferred; source '{}' left intact",
-            source.display()
-        ));
+        report.errors.push(format!("some entries were not transferred; source '{}' left intact", source.display()));
         return Ok(report);
     }
     if let Some(problem) = verify(&plan, &transferred) {
@@ -189,7 +195,10 @@ fn verify(plan: &CopyPlan, transferred: &std::collections::HashSet<PathBuf>) -> 
         }
         if e.kind == FileKind::File {
             match std::fs::symlink_metadata(&e.source_path) {
-                Ok(now) if now.len() == e.meta.len() && now.mtime() == e.meta.mtime() && now.mtime_nsec() == e.meta.mtime_nsec() => {}
+                Ok(now)
+                    if now.len() == e.meta.len()
+                        && now.mtime() == e.meta.mtime()
+                        && now.mtime_nsec() == e.meta.mtime_nsec() => {}
                 _ => return Some(format!("'{}' changed during the move", e.source_path.display())),
             }
         }

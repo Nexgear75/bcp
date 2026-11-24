@@ -91,7 +91,12 @@ impl Shared<'_> {
 /// # Errors
 /// Only in `--strict` mode (first failure) or when the thread pool can't be
 /// built. Otherwise failures are collected in the report.
-pub fn execute_plan(plan: &CopyPlan, config: &Config, counters: &CopyCounters, cancel: &CancelState) -> anyhow::Result<ExecOutcome> {
+pub fn execute_plan(
+    plan: &CopyPlan,
+    config: &Config,
+    counters: &CopyCounters,
+    cancel: &CancelState,
+) -> anyhow::Result<ExecOutcome> {
     let sh = Shared {
         config,
         counters,
@@ -196,7 +201,8 @@ pub fn execute_plan(plan: &CopyPlan, config: &Config, counters: &CopyCounters, c
     if !sh.stopped() {
         for job in plan.dirs.iter().rev() {
             if !job.replace || config.preserve.any() {
-                let problems = metadata::apply(&job.entry.source_path, &job.entry.meta, Target::Path(&job.dest), config.preserve);
+                let problems =
+                    metadata::apply(&job.entry.source_path, &job.entry.meta, Target::Path(&job.dest), config.preserve);
                 sh.metadata_problems(&job.dest, problems);
             }
         }
@@ -315,7 +321,8 @@ fn copy_regular(
     cancelled: &AtomicBool,
 ) -> anyhow::Result<(u64, Vec<String>)> {
     let mut src = File::open(&entry.source_path).with_context(|| format!("open '{}'", entry.source_path.display()))?;
-    let mut tmp = TempFile::create_for(dest).with_context(|| format!("create temp file next to '{}'", dest.display()))?;
+    let mut tmp =
+        TempFile::create_for(dest).with_context(|| format!("create temp file next to '{}'", dest.display()))?;
 
     let total = copy_data(&mut src, &mut tmp.file, entry, config, bytes, cancelled)?;
 
@@ -371,7 +378,14 @@ fn copy_data(
         }
         advise_sequential(src);
     }
-    let rest = crate::copy::chunked_copy_with_progress(src, dst, size.saturating_sub(done), config.buffer_size, bytes, cancelled)?;
+    let rest = crate::copy::chunked_copy_with_progress(
+        src,
+        dst,
+        size.saturating_sub(done),
+        config.buffer_size,
+        bytes,
+        cancelled,
+    )?;
     Ok(done + rest)
 }
 
@@ -387,8 +401,7 @@ fn clone_into_place(job: &FileJob, config: &Config) -> anyhow::Result<Vec<String
         crate::atomic::sync_file(&f)?;
     }
     drop(f);
-    tmp.install(&job.dest, job.replace, config.backup_suffix.as_deref())
-        .map_err(|e| map_install_err(e, &job.dest))?;
+    tmp.install(&job.dest, job.replace, config.backup_suffix.as_deref()).map_err(|e| map_install_err(e, &job.dest))?;
     Ok(problems)
 }
 

@@ -5,8 +5,8 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use progress_copy::atomic::atomic_copy;
 use tempfile::TempDir;
@@ -103,14 +103,9 @@ fn test_atomic_copy_cancellation() {
     assert!(!dst.exists(), "No partial file should exist after cancelled copy");
 
     // Temp files should be cleaned up — check the dir only has source
-    let entries: Vec<_> = std::fs::read_dir(dir.path())
-        .unwrap()
-        .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
-        .collect();
-    assert_eq!(
-        entries.len(), 1,
-        "Expected only source file in dir, got: {:?}", entries
-    );
+    let entries: Vec<_> =
+        std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().to_string()).collect();
+    assert_eq!(entries.len(), 1, "Expected only source file in dir, got: {:?}", entries);
     assert!(entries.contains(&"src.bin".to_string()));
 }
 
@@ -153,14 +148,9 @@ fn test_atomic_copy_no_partial_on_error() {
     assert!(!dst.exists(), "No dest file must remain after error");
 
     // No stray temp files in the directory (only source + possibly nothing else)
-    let entries: Vec<_> = std::fs::read_dir(dir.path())
-        .unwrap()
-        .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
-        .collect();
-    assert_eq!(
-        entries.len(), 1,
-        "Expected only source file in directory, got: {:?}", entries
-    );
+    let entries: Vec<_> =
+        std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().to_string()).collect();
+    assert_eq!(entries.len(), 1, "Expected only source file in directory, got: {:?}", entries);
 }
 
 // ── Test: temp file created in dest.parent(), not /tmp ─────────────
@@ -183,13 +173,8 @@ fn test_atomic_copy_temp_in_dest_dir() {
     // After persist, only dest.bin should be in the subdir.
     // If the temp file was created in /tmp (Pitfall #2), rename would
     // fail with EXDEV, or the temp would remain in /tmp.
-    let entries: Vec<_> = std::fs::read_dir(&sub)
-        .unwrap()
-        .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
-        .collect();
-    assert_eq!(
-        entries.len(), 1,
-        "Expected exactly dest.bin in subdir, got: {:?}", entries
-    );
+    let entries: Vec<_> =
+        std::fs::read_dir(&sub).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().to_string()).collect();
+    assert_eq!(entries.len(), 1, "Expected exactly dest.bin in subdir, got: {:?}", entries);
     assert!(entries.contains(&"dest.bin".to_string()));
 }

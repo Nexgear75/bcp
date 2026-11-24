@@ -151,8 +151,6 @@ impl Config {
     /// Resolve the effective worker-thread count.
     #[must_use]
     pub fn thread_count(&self) -> usize {
-        self.threads.unwrap_or_else(|| {
-            std::thread::available_parallelism().map_or(4, std::num::NonZero::get)
-        })
+        self.threads.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, std::num::NonZero::get))
     }
 }

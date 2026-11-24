@@ -19,7 +19,12 @@ enum Sync {
 /// data is copied, flushed to disk and verified before the source is deleted;
 /// if anything goes wrong, the source is left untouched.
 #[derive(Parser)]
-#[command(name = "bmv", version, about, after_help = "Exit status: 0 success, 1 at least one error, 2 usage error, 130 interrupted.")]
+#[command(
+    name = "bmv",
+    version,
+    about,
+    after_help = "Exit status: 0 success, 1 at least one error, 2 usage error, 130 interrupted."
+)]
 #[allow(clippy::struct_excessive_bools)]
 struct Args {
     /// Replace existing destinations

@@ -139,13 +139,7 @@ impl TempFile {
         let mut last = None;
         for _ in 0..8 {
             let path = TempPath::reserve(dest);
-            match std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(path.path())
-            {
+            match std::fs::OpenOptions::new().read(true).write(true).create_new(true).mode(0o600).open(path.path()) {
                 Ok(file) => return Ok(Self { file, path }),
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => last = Some(e),
                 Err(e) => {
@@ -245,10 +239,8 @@ pub fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
 }
 
 fn is_unsupported(e: &io::Error) -> bool {
-    matches!(
-        e.raw_os_error(),
-        Some(libc::EINVAL | libc::ENOSYS | libc::ENOTSUP | libc::ENOTTY)
-    ) || e.raw_os_error() == Some(libc::EOPNOTSUPP)
+    matches!(e.raw_os_error(), Some(libc::EINVAL | libc::ENOSYS | libc::ENOTSUP | libc::ENOTTY))
+        || e.raw_os_error() == Some(libc::EOPNOTSUPP)
 }
 
 #[cfg(target_os = "linux")]
@@ -256,14 +248,7 @@ fn sys_rename_noreplace(from: &CString, to: &CString) -> io::Result<()> {
     const RENAME_NOREPLACE: libc::c_uint = 1;
     // Raw syscall: works with both glibc and musl.
     let rc = unsafe {
-        libc::syscall(
-            libc::SYS_renameat2,
-            libc::AT_FDCWD,
-            from.as_ptr(),
-            libc::AT_FDCWD,
-            to.as_ptr(),
-            RENAME_NOREPLACE,
-        )
+        libc::syscall(libc::SYS_renameat2, libc::AT_FDCWD, from.as_ptr(), libc::AT_FDCWD, to.as_ptr(), RENAME_NOREPLACE)
     };
     if rc == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
 }

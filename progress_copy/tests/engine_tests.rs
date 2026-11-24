@@ -8,11 +8,7 @@ use progress_copy::config::{Config, ProgressMode};
 use progress_copy::{run_copy, run_move};
 
 fn silent_recursive() -> Config {
-    Config {
-        recursive: true,
-        progress: ProgressMode::Silent,
-        ..Default::default()
-    }
+    Config { recursive: true, progress: ProgressMode::Silent, ..Default::default() }
 }
 
 fn write(path: &std::path::Path, content: &[u8]) {

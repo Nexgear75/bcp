@@ -3,8 +3,8 @@
 
 use std::cell::RefCell;
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::error::CopyError;
 
@@ -160,7 +160,12 @@ mod tests {
         let mut out = Vec::new();
         let counter = Arc::new(AtomicU64::new(0));
         let n = chunked_copy_with_progress(
-            &mut Cursor::new(&data), &mut out, data.len() as u64, 1024 * 1024, &counter, &AtomicBool::new(false),
+            &mut Cursor::new(&data),
+            &mut out,
+            data.len() as u64,
+            1024 * 1024,
+            &counter,
+            &AtomicBool::new(false),
         )
         .unwrap();
         assert_eq!(n, data.len() as u64);
@@ -184,7 +189,8 @@ mod tests {
         let data = vec![1u8; 1024];
         let mut out = Vec::new();
         let counter = Arc::new(AtomicU64::new(0));
-        let r = chunked_copy_with_progress(&mut Cursor::new(&data), &mut out, 1024, 1024, &counter, &AtomicBool::new(true));
+        let r =
+            chunked_copy_with_progress(&mut Cursor::new(&data), &mut out, 1024, 1024, &counter, &AtomicBool::new(true));
         assert!(matches!(r, Err(CopyError::Cancelled)));
         assert!(out.is_empty());
     }

@@ -26,7 +26,13 @@ pub enum Decision {
 ///
 /// # Errors
 /// `DestinationExists` when refusing, or a type mismatch (dir vs non-dir).
-pub fn decide(entry: &FileEntry, dest: &Path, dest_meta: Option<&std::fs::Metadata>, config: &Config, tool: &str) -> anyhow::Result<Decision> {
+pub fn decide(
+    entry: &FileEntry,
+    dest: &Path,
+    dest_meta: Option<&std::fs::Metadata>,
+    config: &Config,
+    tool: &str,
+) -> anyhow::Result<Decision> {
     let Some(dm) = dest_meta else { return Ok(Decision::Proceed { replace: false }) };
 
     if dm.is_dir() && entry.kind != FileKind::Directory {
@@ -221,7 +227,10 @@ mod tests {
 
         assert_eq!(decide(&e, &dst, None, &cfg(Overwrite::Refuse), "t").unwrap(), Decision::Proceed { replace: false });
         assert!(decide(&e, &dst, Some(&dm), &cfg(Overwrite::Refuse), "t").is_err());
-        assert_eq!(decide(&e, &dst, Some(&dm), &cfg(Overwrite::Force), "t").unwrap(), Decision::Proceed { replace: true });
+        assert_eq!(
+            decide(&e, &dst, Some(&dm), &cfg(Overwrite::Force), "t").unwrap(),
+            Decision::Proceed { replace: true }
+        );
         assert_eq!(decide(&e, &dst, Some(&dm), &cfg(Overwrite::Skip), "t").unwrap(), Decision::Skip);
     }
 

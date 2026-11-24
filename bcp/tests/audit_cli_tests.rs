@@ -91,7 +91,12 @@ fn buffer_size_and_threads_flags() {
     let d = tempfile::tempdir().unwrap();
     let src = d.path().join("a");
     fs::write(&src, vec![5u8; 100_000]).unwrap();
-    bcp().args(["--buffer-size", "64KiB", "-j", "2", "--no-clone"]).arg(&src).arg(d.path().join("b")).assert().success();
+    bcp()
+        .args(["--buffer-size", "64KiB", "-j", "2", "--no-clone"])
+        .arg(&src)
+        .arg(d.path().join("b"))
+        .assert()
+        .success();
     assert_eq!(fs::read(d.path().join("b")).unwrap().len(), 100_000);
     bcp().args(["--buffer-size", "0"]).arg(&src).arg(d.path().join("c")).assert().code(2);
     bcp().args(["-j", "0"]).arg(&src).arg(d.path().join("c")).assert().code(1);
@@ -116,7 +121,13 @@ fn several_sources_into_missing_directory_fail() {
     let (a, b) = (d.path().join("a"), d.path().join("b"));
     fs::write(&a, b"a").unwrap();
     fs::write(&b, b"b").unwrap();
-    bcp().arg(&a).arg(&b).arg(d.path().join("nope")).assert().code(1).stderr(predicate::str::contains("not a directory"));
+    bcp()
+        .arg(&a)
+        .arg(&b)
+        .arg(d.path().join("nope"))
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("not a directory"));
 }
 
 #[test]
@@ -151,7 +162,13 @@ fn dry_run_prints_plan_and_writes_nothing() {
     let d = tempfile::tempdir().unwrap();
     let src = d.path().join("a");
     fs::write(&src, b"x").unwrap();
-    bcp().arg("--dry-run").arg(&src).arg(d.path().join("b")).assert().success().stderr(predicate::str::contains("Dry run"));
+    bcp()
+        .arg("--dry-run")
+        .arg(&src)
+        .arg(d.path().join("b"))
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("Dry run"));
     assert!(!d.path().join("b").exists());
 }
 

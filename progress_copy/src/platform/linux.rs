@@ -2,8 +2,8 @@
 
 use std::io;
 use std::os::unix::io::AsRawFd;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Bytes per `copy_file_range` call: small enough for a live progress bar and
 /// a responsive Ctrl+C, large enough to keep syscall overhead negligible.
@@ -47,9 +47,8 @@ pub fn copy_file_range(
         if cancelled.load(Ordering::Relaxed) {
             return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
         }
-        let ret = unsafe {
-            libc::copy_file_range(src_fd, std::ptr::null_mut(), dst_fd, std::ptr::null_mut(), CHUNK, 0)
-        };
+        let ret =
+            unsafe { libc::copy_file_range(src_fd, std::ptr::null_mut(), dst_fd, std::ptr::null_mut(), CHUNK, 0) };
         if ret < 0 {
             let err = io::Error::last_os_error();
             return match err.raw_os_error() {

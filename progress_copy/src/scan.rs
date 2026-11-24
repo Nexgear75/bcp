@@ -104,11 +104,7 @@ fn canonical_lenient(p: &Path) -> PathBuf {
 pub fn check_not_into_itself(source: &Path, dest: &Path) -> anyhow::Result<()> {
     let (Ok(src), dst) = (std::fs::canonicalize(source), canonical_lenient(dest)) else { return Ok(()) };
     if dst.starts_with(&src) {
-        anyhow::bail!(
-            "cannot copy a directory, '{}', into itself, '{}'",
-            source.display(),
-            dest.display()
-        );
+        anyhow::bail!("cannot copy a directory, '{}', into itself, '{}'", source.display(), dest.display());
     }
     Ok(())
 }

@@ -34,9 +34,7 @@ fn test_same_device_move() {
     fs::write(&src, b"payload").unwrap();
 
     let mut cmd = Command::cargo_bin("bmv").unwrap();
-    cmd.arg("--no-progress")
-        .arg(src.to_string_lossy().as_ref())
-        .arg(dst.to_string_lossy().as_ref());
+    cmd.arg("--no-progress").arg(src.to_string_lossy().as_ref()).arg(dst.to_string_lossy().as_ref());
     cmd.assert().success();
 
     assert!(!src.exists(), "source removed after move");
@@ -64,9 +62,7 @@ fn test_move_into_directory() {
     fs::create_dir(&destdir).unwrap();
 
     let mut cmd = Command::cargo_bin("bmv").unwrap();
-    cmd.arg("--no-progress")
-        .arg(src.to_string_lossy().as_ref())
-        .arg(destdir.to_string_lossy().as_ref());
+    cmd.arg("--no-progress").arg(src.to_string_lossy().as_ref()).arg(destdir.to_string_lossy().as_ref());
     cmd.assert().success();
 
     assert!(!src.exists());

@@ -11,3 +11,12 @@ graphify-out/
 *.swp
 .idea/
 .vscode/
+
+# Local planning / agent notes (kept out of the public repo)
+.planning/
+AGENTS.md
+CLAUDE.md
+IDEA.md
+
+# Release packaging output
+/dist/

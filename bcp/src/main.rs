@@ -15,7 +15,12 @@ enum Sync {
 
 /// Copy files and directories with progress bars — a safer, faster `cp`.
 #[derive(Parser)]
-#[command(name = "bcp", version, about, after_help = "Exit status: 0 success, 1 at least one error, 2 usage error, 130 interrupted.")]
+#[command(
+    name = "bcp",
+    version,
+    about,
+    after_help = "Exit status: 0 success, 1 at least one error, 2 usage error, 130 interrupted."
+)]
 #[allow(clippy::struct_excessive_bools)]
 struct Args {
     /// Replace existing destination files
