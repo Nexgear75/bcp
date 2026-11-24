@@ -1,0 +1,177 @@
+name: Release
+
+# Push a tag like v0.2.0 (matching the version in Cargo.toml) to publish a
+# release: binaries for 4 targets, checksums, GitHub release, Homebrew formula.
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to (re)build, e.g. v0.1.0
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+
+env:
+  CARGO_TERM_COLOR: always
+  TAG: ${{ github.event.inputs.tag || github.ref_name }}
+
+jobs:
+  check:
+    name: check version
+    runs-on: ubuntu-latest
+    outputs:
+      prerelease: ${{ steps.v.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.TAG }}
+      - id: v
+        run: |
+          set -eu
+          version=$(cargo metadata --format-version 1 --no-deps | jq -r '.packages[] | select(.name == "bcp") | .version')
+          if [ "v$version" != "$TAG" ]; then
+            echo "::error::tag $TAG does not match Cargo.toml version $version"
+            exit 1
+          fi
+          grep -q "^## \[$version\]" CHANGELOG.md || { echo "::error::CHANGELOG.md has no section for $version"; exit 1; }
+          case "$version" in *-*) echo "prerelease=true" >>"$GITHUB_OUTPUT" ;; *) echo "prerelease=false" >>"$GITHUB_OUTPUT" ;; esac
+
+  build:
+    name: build ${{ matrix.target }}
+    needs: check
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { target: aarch64-apple-darwin, os: macos-latest, run: true }
+          - { target: x86_64-apple-darwin, os: macos-latest, run: false }
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-latest, run: true }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm, run: true }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.TAG }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo build --release --locked --target ${{ matrix.target }} -p bcp -p bmv
+      - name: Smoke test
+        if: matrix.run
+        run: |
+          set -eux
+          bin=target/${{ matrix.target }}/release
+          $bin/bcp --version | grep -q "${TAG#v}"
+          echo hello > a
+          $bin/bcp --no-progress a b
+          $bin/bmv --no-progress b c
+          test "$(cat c)" = hello && test ! -e b
+      - if: runner.os == 'Linux'
+        run: file target/${{ matrix.target }}/release/bcp | grep -q 'statically linked'
+      - run: cargo xtask assets target/assets
+      - run: scripts/package.sh ${{ matrix.target }} target/assets
+      - uses: actions/upload-artifact@v7
+        with:
+          name: bcp-${{ matrix.target }}
+          path: dist/bcp-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: GitHub release
+    needs: [check, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.TAG }}
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          pattern: bcp-*
+          merge-multiple: true
+      - name: Checksums
+        run: cd dist && sha256sum bcp-*.tar.gz | tee sha256sums.txt
+      - name: Release notes from CHANGELOG.md
+        run: |
+          version="${TAG#v}"
+          awk -v v="$version" '
+            $0 ~ "^## \\[" v "\\]" { on = 1; next }
+            on && /^## \[/ { exit }
+            on && /^\[.*\]: / { exit }
+            on { print }
+          ' CHANGELOG.md >notes.md
+          {
+            echo
+            echo "### Install"
+            echo
+            echo '```sh'
+            echo "brew install nexgear75/tap/bcp"
+            echo "# or"
+            echo "curl -fsSL https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/install.sh | sh"
+            echo '```'
+          } >>notes.md
+          cat notes.md
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PRERELEASE: ${{ needs.check.outputs.prerelease }}
+        run: |
+          set -eu
+          files="dist/bcp-*.tar.gz dist/sha256sums.txt install.sh"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            # shellcheck disable=SC2086
+            gh release upload "$TAG" $files --clobber
+            gh release edit "$TAG" --notes-file notes.md
+          else
+            flag=""
+            [ "$PRERELEASE" = true ] && flag="--prerelease"
+            # shellcheck disable=SC2086
+            gh release create "$TAG" $files --title "$TAG" --notes-file notes.md --verify-tag $flag
+          fi
+      - uses: actions/upload-artifact@v7
+        with:
+          name: sha256sums
+          path: dist/sha256sums.txt
+
+  homebrew:
+    name: Homebrew tap
+    needs: [check, release]
+    if: needs.check.outputs.prerelease == 'false'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.TAG }}
+      - uses: actions/checkout@v7
+        with:
+          repository: Nexgear75/homebrew-tap
+          ssh-key: ${{ secrets.TAP_DEPLOY_KEY }}
+          path: tap
+      - uses: actions/download-artifact@v8
+        with:
+          name: sha256sums
+      - name: Update formula
+        run: |
+          set -eu
+          mkdir -p tap/Formula
+          scripts/homebrew-formula.sh "$TAG" sha256sums.txt >tap/Formula/bcp.rb
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/bcp.rb
+          if git diff --cached --quiet; then
+            echo "formula already up to date"
+          else
+            git commit -m "bcp ${TAG#v}"
+            git push
+          fi
