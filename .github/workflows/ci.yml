@@ -94,7 +94,7 @@ jobs:
         run: |
           set -eux
           bin=target/x86_64-unknown-linux-musl/release
-          file $bin/bcp | grep -q 'statically linked'
+          file $bin/bcp | grep -Eq 'static(ally|-pie) linked'
           echo hello > a
           $bin/bcp --no-progress a b
           $bin/bmv --no-progress b c

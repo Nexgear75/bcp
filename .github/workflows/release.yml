@@ -75,7 +75,7 @@ jobs:
           $bin/bmv --no-progress b c
           test "$(cat c)" = hello && test ! -e b
       - if: runner.os == 'Linux'
-        run: file target/${{ matrix.target }}/release/bcp | grep -q 'statically linked'
+        run: file target/${{ matrix.target }}/release/bcp | grep -Eq 'static(ally|-pie) linked'
       - run: cargo xtask assets target/assets
       - run: scripts/package.sh ${{ matrix.target }} target/assets
       - uses: actions/upload-artifact@v7
