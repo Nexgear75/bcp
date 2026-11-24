@@ -1,5 +1,5 @@
 [workspace]
-members = ["progress_copy", "bcp", "bmv"]
+members = ["progress_copy", "bcp", "bmv", "xtask"]
 resolver = "3"
 
 [workspace.package]

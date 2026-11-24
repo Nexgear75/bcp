@@ -1,0 +1,17 @@
+[package]
+name = "xtask"
+description = "Build helpers: shell completions and man pages"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+progress_copy.workspace = true
+clap.workspace = true
+clap_complete = "4.6.12"
+clap_mangen = "0.3.4"
+
+[dev-dependencies]
+tempfile.workspace = true

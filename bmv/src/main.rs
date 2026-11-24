@@ -1,88 +1,9 @@
-use std::path::PathBuf;
+mod args;
 
-use clap::{CommandFactory, Parser, ValueEnum, error::ErrorKind};
+use clap::{CommandFactory, Parser, error::ErrorKind};
 use progress_copy::{Config, Overwrite, Preserve, SyncMode, cli, run_move};
 
-#[derive(Clone, Copy, ValueEnum)]
-enum Sync {
-    /// Same as batch for moves (a source is never deleted before its copy is on disk)
-    None,
-    /// Flush everything once before deleting sources (default)
-    Batch,
-    /// Flush each file before installing it
-    Full,
-}
-
-/// Move (rename) files and directories with progress bars — a safer `mv`.
-///
-/// On the same filesystem this is an atomic rename. Across filesystems the
-/// data is copied, flushed to disk and verified before the source is deleted;
-/// if anything goes wrong, the source is left untouched.
-#[derive(Parser)]
-#[command(
-    name = "bmv",
-    version,
-    about,
-    after_help = "Exit status: 0 success, 1 at least one error, 2 usage error, 130 interrupted."
-)]
-#[allow(clippy::struct_excessive_bools)]
-struct Args {
-    /// Replace existing destinations
-    #[arg(short = 'f', long, overrides_with_all = ["no_clobber", "interactive"])]
-    force: bool,
-    /// Never replace existing destinations (skip them silently)
-    #[arg(short = 'n', long, overrides_with_all = ["force", "interactive"])]
-    no_clobber: bool,
-    /// Ask before replacing an existing destination
-    #[arg(short = 'i', long, overrides_with_all = ["force", "no_clobber"])]
-    interactive: bool,
-    /// Move only when the source is newer than the destination
-    #[arg(short = 'u', long)]
-    update: bool,
-    /// Keep a backup of each replaced destination (NAME~)
-    #[arg(short = 'b', long)]
-    backup: bool,
-    /// Backup suffix (implies --backup)
-    #[arg(short = 'S', long, value_name = "SUFFIX")]
-    suffix: Option<String>,
-
-    /// Move all sources into DIRECTORY
-    #[arg(short = 't', long, value_name = "DIRECTORY", conflicts_with = "no_target_directory")]
-    target_directory: Option<PathBuf>,
-    /// Treat DEST as a normal file, never as a directory to move into
-    #[arg(short = 'T', long)]
-    no_target_directory: bool,
-
-    /// Worker threads for cross-filesystem copies (default: number of CPUs)
-    #[arg(short = 'j', long, value_name = "N")]
-    threads: Option<usize>,
-    /// Read/write buffer size, e.g. 256K, 1M (default: 1M)
-    #[arg(long, value_name = "SIZE", value_parser = cli::parse_size)]
-    buffer_size: Option<usize>,
-    /// Durability for cross-filesystem moves: batch (default) or full
-    #[arg(long, value_enum, value_name = "MODE")]
-    sync: Option<Sync>,
-
-    /// Stop at the first error instead of continuing
-    #[arg(long)]
-    strict: bool,
-    /// Show what would be done without changing anything
-    #[arg(long)]
-    dry_run: bool,
-    /// Explain what is being done
-    #[arg(short = 'v', long)]
-    verbose: bool,
-    /// Single-line progress
-    #[arg(short = 'q', long)]
-    quiet: bool,
-    /// No progress output at all
-    #[arg(long)]
-    no_progress: bool,
-
-    /// SOURCE... DEST, or SOURCE... with -t DIRECTORY
-    #[arg(required = true, value_name = "PATHS")]
-    paths: Vec<PathBuf>,
-}
+use args::{Args, Sync};
 
 fn main() {
     std::process::exit(real_main());
