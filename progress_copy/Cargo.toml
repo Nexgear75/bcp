@@ -17,8 +17,8 @@ indicatif = "0.18.4"
 ctrlc = { version = "3.5.2", features = ["termination"] }
 thiserror = "2.0.18"
 rayon = "1.12.0"
-jwalk = "0.8.1"
-nix = { version = "0.31.3", features = ["fs"] }
+jwalk = "0.9.0"
+nix = { version = "0.32.0", features = ["fs"] }
 bytesize = "2.3.1"
 xattr = "1.6.1"
 console = "0.16.3"
